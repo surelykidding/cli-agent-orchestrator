@@ -169,6 +169,13 @@ _SERVER_DEFAULTS = {
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
     "startup_prompt_handler_timeout": 20,
+    # Kimi Code 0.34 asks "Trust this folder?" on every un-trusted working
+    # directory and blocks boot until answered. CAO manages the worktree's
+    # MCP via the session-local KIMI_CODE_HOME/mcp.json (user-global scope),
+    # so auto-accepting is the safe default; CAO already treats Kimi workers
+    # as unrestricted (SOFT_ENFORCEMENT_PROVIDERS). Disable to make Kimi init
+    # fail safe instead of auto-escalating workspace trust.
+    "kimi_auto_trust_workspaces": True,
     # Rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
     # status detection and GET /terminals/{id}/output (mode=full) — see
     # StatusMonitor._process_chunk. The old fixed 8192 was measured too small
@@ -191,6 +198,7 @@ _SERVER_ENV_VARS = {
     "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
     "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
     "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+    "kimi_auto_trust_workspaces": "CAO_KIMI_AUTO_TRUST_WORKSPACES",
     "state_buffer_max": "CAO_STATE_BUFFER_MAX",
 }
 
@@ -215,6 +223,10 @@ def get_server_settings() -> Dict[str, Any]:
         prompt; it stops once no new prompt appears for this many seconds (so a
         dialog a cold/containerized start renders late is still handled). Total
         time is bounded by provider_init_timeout.
+      - kimi_auto_trust_workspaces (true): Auto-accept Kimi Code 0.34's
+        "Trust this folder?" dialog (a plain Enter) so headless workers can
+        boot in CAO-managed worktrees. False makes Kimi init fail safe instead
+        of auto-escalating workspace trust.
       - state_buffer_max (32768): Bytes of raw terminal output StatusMonitor
         keeps per terminal for raw-path status detection and
         GET /terminals/{id}/output (mode=full)
@@ -254,7 +266,14 @@ def get_server_settings() -> Dict[str, Any]:
         raw = os.environ.get(env_name)
         if raw is not None and raw.strip() != "":
             try:
-                result[key] = int(raw)
+                if isinstance(_SERVER_DEFAULTS[key], bool):
+                    # Boolean setting: accept truthy/falsy strings
+                    # ("true"/"false", "1"/"0", "yes"/"no", ...).
+                    parsed = _coerce_optional_bool(raw, label=env_name)
+                    if parsed is not None:
+                        result[key] = parsed
+                else:
+                    result[key] = int(raw)
             except ValueError:
                 logger.warning(
                     f"Ignoring invalid {env_name}={raw!r} (expected int); "
@@ -264,6 +283,14 @@ def get_server_settings() -> Dict[str, Any]:
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
+        if isinstance(default, bool):
+            # Boolean settings are exempt from the numeric checks below; a
+            # settings.json value that is not a real bool (e.g. the string
+            # "false") falls back to the default instead of being coerced.
+            if not isinstance(val, bool):
+                logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
+                result[key] = default
+            continue
         # int(val), not val <= 0: a float in (0, 1) (e.g. a settings.json
         # value of 0.5) passes val <= 0 but truncates to 0 once coerced to
         # int below (state_buffer_max) or by Queue(maxsize=...)

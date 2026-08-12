@@ -305,8 +305,36 @@ class TestGetServerSettings:
             "event_bus_max_queue_size": 1024,
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 20,
+            "kimi_auto_trust_workspaces": True,
             "state_buffer_max": 32768,
         }
+
+    def test_bool_setting_accepts_settings_json_false(self, settings_file):
+        """kimi_auto_trust_workspaces is a bool setting: settings.json 'false'
+        must disable it (no numeric coercion, no fallback to default)."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"kimi_auto_trust_workspaces": False}})
+        result = get_server_settings()
+        assert result["kimi_auto_trust_workspaces"] is False
+
+    def test_bool_setting_env_false_disables(self, settings_file, monkeypatch):
+        """The CAO_KIMI_AUTO_TRUST_WORKSPACES env var accepts falsy strings
+        ('false'/'0'/'no') and disables the setting — the documented escape
+        hatch for the trust auto-accept must actually work."""
+        from cli_agent_orchestrator.services import settings_service
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        for raw in ("false", "0", "no", "off"):
+            monkeypatch.setenv("CAO_KIMI_AUTO_TRUST_WORKSPACES", raw)
+            settings_service._server_settings_cache = None  # cache keys on file mtime only
+            assert get_server_settings()["kimi_auto_trust_workspaces"] is False
+        monkeypatch.setenv("CAO_KIMI_AUTO_TRUST_WORKSPACES", "true")
+        settings_service._server_settings_cache = None
+        assert get_server_settings()["kimi_auto_trust_workspaces"] is True
+        monkeypatch.delenv("CAO_KIMI_AUTO_TRUST_WORKSPACES")
+        settings_service._server_settings_cache = None
+        assert get_server_settings()["kimi_auto_trust_workspaces"] is True
 
     def test_reads_custom_values(self, settings_file):
         """Reads custom values from settings.json."""

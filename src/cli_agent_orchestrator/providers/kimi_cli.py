@@ -11,8 +11,8 @@ Key characteristics:
 - Thinking output: Gray italic ``•`` bullets (ANSI color 38;5;244 + italic)
 - User input: Displayed in a bordered box using box-drawing characters (╭│╰)
 - Auto-approve: ``--yolo`` flag bypasses all tool action confirmations
-- Agent profiles: ``--agent-file FILE`` (YAML format, extends built-in 'default' agent)
-- MCP config: ``--mcp-config TEXT`` (JSON configuration, repeatable flag)
+- Agent profiles: ``--agent-file FILE`` (Markdown agent file; ``${base_prompt}`` keeps the built-in agent)
+- MCP config: session-local ``mcp.json`` under ``KIMI_CODE_HOME`` (user config untouched)
 - Exit commands: ``/exit``, ``exit``, ``quit``, or Ctrl-D
 - Status bar: ``HH:MM [yolo] agent (model, thinking) ctrl-x: toggle mode context: X.X%``
 
@@ -32,9 +32,7 @@ import os
 import re
 import shlex
 import shutil
-import stat
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,15 +47,6 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
-
-# Serializes concurrent _ensure_mcp_timeout() read-modify-writes to
-# ~/.kimi/config.toml -- after the async conversion (issue #494),
-# _build_kimi_command runs inside asyncio.to_thread, so N concurrent inits can
-# enter this method in N threads at once. Without a lock, the check-then-act
-# on _mcp_timeout_configured races (two threads both pass the "not configured
-# yet" check) and the read-modify-write itself races (one thread's write can
-# clobber content another thread already read).
-_KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 # Custom exception for provider errors
@@ -104,6 +93,22 @@ WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 # gate holds it PROCESSING). We answer 's' to skip reminders for this version
 # (persisted, so it does not recur until the next release).
 UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
+
+# Folder-trust dialog. New Kimi Code asks "Trust this folder?" (↑↓ navigate ·
+# Enter select) before loading PROJECT-level MCP servers (.mcp.json,
+# .kimi-code/mcp.json) and blocks the whole boot until answered. Verified on
+# kimi 0.34: answering "Don't trust" makes kimi REFUSE to run in the folder
+# (clean exit to the shell), so CAO accepts the default "Trust this folder"
+# (a plain Enter) — governed by the kimi_auto_trust_workspaces server
+# setting, NOT by the session's allowed_tools (CAO treats Kimi workers as
+# unrestricted; see SOFT_ENFORCEMENT_PROVIDERS). This enables project-level
+# MCP servers IF the worktree has any — CAO never creates them and manages
+# MCP via the session-local KIMI_CODE_HOME/mcp.json (user-global scope,
+# loaded regardless of trust). The trust decision is recorded in the
+# ephemeral session home only; the user's real ~/.kimi-code is left
+# untouched except for the empty credentials/ directory CAO prepares there
+# per kimi's expected layout (see _prepare_session_kimi_home).
+TRUST_PROMPT_PATTERN = r"Trust this folder\?"
 
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
@@ -193,12 +198,6 @@ class KimiCliProvider(BaseProvider):
     and cleanup. Kimi CLI agent profiles are optional — if not provided,
     Kimi uses its built-in default agent.
     """
-
-    # Class-level flag: ensures ~/.kimi/config.toml MCP timeout is set only once,
-    # even when multiple KimiCliProvider instances are created in parallel (e.g.,
-    # 3 data_analyst workers via assign). Without this, concurrent read/write to
-    # the config file causes race conditions and file corruption.
-    _mcp_timeout_configured = False
 
     # Class-level prompt regex shared between status detection
     # and ``extract_session_context``. Bounded quantifiers
@@ -291,11 +290,19 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--agent-file FILE] [--mcp-config JSON]
+            KIMI_MCP_TOOL_TIMEOUT_MS=600000 [KIMI_CODE_HOME=<session-home>] \
+            TERM=xterm-256color kimi --yolo [--model MODEL] [--agent-file <agent.md>]
 
-        The ``cd`` is required because Kimi CLI v1.20.0+ enforces a per-directory
-        single-instance lock — only one kimi process can run in a given directory.
-        Each provider instance gets its own temp directory to avoid conflicts.
+        The command must NOT ``cd`` anywhere: CAO owns the working directory
+        (the terminal is already positioned in the task's worktree) and the
+        provider inherits it. The per-instance temp directory is used only as
+        scratch space for the agent file and the session-local Kimi home
+        (``agent.md`` / ``kimi-home/mcp.json``) — never as Kimi's cwd. The old
+        per-directory single-instance lock workaround (cd'ing into a fresh
+        temp dir) is dropped: one task/worktree = one Kimi writer.
+
+        ``KIMI_MCP_TOOL_TIMEOUT_MS=600000`` raises the MCP tool-call timeout
+        for this process only — no user config file is touched.
 
         The ``TERM=xterm-256color`` override is needed because Kimi CLI v1.20.0+
         silently exits when TERM=tmux-256color (the tmux default).
@@ -305,9 +312,9 @@ class KimiCliProvider(BaseProvider):
         """
         command_parts = ["kimi", "--yolo"]
 
-        # Always create a temp directory for this instance.
-        # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
-        # provider instance needs its own working directory.
+        # Always create a temp directory for this instance: it holds the
+        # generated agent file and the session-local Kimi home (MCP overlay).
+        # It is scratch space only — never Kimi's working directory.
         if not self._temp_dir:
             self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
 
@@ -328,9 +335,11 @@ class KimiCliProvider(BaseProvider):
 
         if profile is not None:
             try:
-                # Build agent file from profile's system prompt.
-                # Kimi uses YAML agent files with a system_prompt_path pointing
-                # to a markdown file. We create both in the temp directory.
+                # Build the agent file from the profile's system prompt. Kimi
+                # Code loads agents from Markdown files (--agent-file); the
+                # ``${base_prompt}`` placeholder is expanded by Kimi's template
+                # system, keeping the default agent capabilities and letting the
+                # CAO prompt ADD role/task constraints on top.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 system_prompt = self._apply_skill_prompt(system_prompt)
 
@@ -345,57 +354,22 @@ class KimiCliProvider(BaseProvider):
                     system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
                 if system_prompt:
-                    # Write the system prompt as a markdown file
-                    prompt_file = os.path.join(self._temp_dir, "system.md")
-                    with open(prompt_file, "w") as f:
-                        f.write(system_prompt)
-
-                    # Create the agent YAML that extends the default agent
-                    # and points to our custom system prompt file.
-                    # Written as plain string to avoid adding PyYAML dependency.
-                    agent_yaml = (
-                        "version: 1\n"
-                        "agent:\n"
-                        "  extend: default\n"
-                        "  system_prompt_path: ./system.md\n"
+                    # Write the system prompt as a session-local Markdown agent
+                    # file (UTF-8). `${base_prompt}` is kept as a literal for
+                    # Kimi's template expansion.
+                    agent_md = os.path.join(self._temp_dir, "agent.md")
+                    agent_md_content = (
+                        "---\n"
+                        "name: cao-agent\n"
+                        "description: CAO-managed Kimi Code agent\n"
+                        "---\n\n"
+                        "${base_prompt}\n\n"
+                        f"{system_prompt}\n"
                     )
-                    agent_file = os.path.join(self._temp_dir, "agent.yaml")
-                    with open(agent_file, "w") as f:
-                        f.write(agent_yaml)
+                    with open(agent_md, "w", encoding="utf-8") as f:
+                        f.write(agent_md_content)
 
-                    command_parts.extend(["--agent-file", agent_file])
-
-                # Add MCP server configuration if present in the agent profile.
-                # Kimi accepts --mcp-config as a JSON string (repeatable flag).
-                if profile.mcpServers:
-                    # Set MCP tool call timeout to 600s by modifying ~/.kimi/config.toml
-                    # directly. We cannot use --config flag because it causes Kimi CLI
-                    # to bypass its default config file, which breaks OAuth authentication
-                    # (shows "model: not set" and /login says "restart without --config").
-                    # Class-level guard ensures this runs only once per process.
-                    self._ensure_mcp_timeout()
-
-                    mcp_config = {}
-                    for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            mcp_config[server_name] = dict(server_config)
-                        else:
-                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
-
-                        # Resolve the bundled cao-mcp-server console script to a
-                        # PATH-independent invocation.
-                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
-
-                        # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                        # can identify the current terminal for handoff/assign operations.
-                        # Kimi CLI does not automatically forward parent shell env vars
-                        # to MCP subprocesses, so we inject it explicitly via the env field.
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
-
-                    command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
+                    command_parts.extend(["--agent-file", agent_md])
 
             except Exception as e:
                 raise ProviderError(
@@ -403,77 +377,222 @@ class KimiCliProvider(BaseProvider):
                     f"'{self._agent_profile}': {e}"
                 )
 
-        # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
+        # Session-local Kimi home: ALWAYS enabled, with or without profile MCP
+        # servers. Without KIMI_CODE_HOME, kimi writes workspace-trust/,
+        # sessions/ and workspaces.json into the USER's real ~/.kimi-code on
+        # every session; the overlay keeps all runtime state under
+        # self._temp_dir and shares only identity/config via symlinks. The
+        # profile's MCP servers (if any) are layered onto the user's own
+        # mcp.json inside the session home; a profile without MCP servers
+        # still gets the overlay, carrying the user's mcp.json along.
+        session_home = self._prepare_session_kimi_home(
+            profile.mcpServers if profile is not None else None
+        )
+
+        # CAO owns cwd: never cd anywhere. Env-prefixed startup only.
+        env_parts = ["KIMI_MCP_TOOL_TIMEOUT_MS=600000"]
+        env_parts.append(f"KIMI_CODE_HOME={shlex.quote(session_home)}")
+        env_parts.append("TERM=xterm-256color")
         kimi_cmd = shlex.join(command_parts)
-        return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
+        return " ".join(env_parts) + " " + kimi_cmd
 
-    @classmethod
-    def _ensure_mcp_timeout(cls) -> None:
-        """Ensure MCP tool call timeout is set to 600s in ~/.kimi/config.toml.
+    def _prepare_session_kimi_home(self, mcp_servers: Optional[Dict[str, Any]] = None) -> str:
+        """Create a session-local Kimi home carrying the CAO profile's MCP overlay.
 
-        Called once per process (guarded by class-level flag). Kimi CLI defaults
-        to tool_call_timeout_ms=60000 (60s) for MCP tool calls, which is too short
-        for handoff operations. We modify the config file directly instead of using
-        ``--config`` CLI flag, because ``--config`` causes Kimi CLI to bypass the
-        default config file and breaks OAuth authentication.
+        New Kimi Code reads its data directory from ``KIMI_CODE_HOME``
+        (falling back to ``~/.kimi-code``): config, OAuth credentials AND
+        ``mcp.json`` all live there. To give each worker its own MCP config
+        without touching the user's global files — and without writing
+        ``.kimi-code/mcp.json`` into the target worktree — this materializes
+        a private copy under ``self._temp_dir`` and points the launched
+        process at it via ``KIMI_CODE_HOME``.
 
-        The timeout is NOT restored on cleanup because:
-        1. Multiple Kimi instances may share the config file concurrently
-        2. 600s is a strictly better default for anyone using MCP tools
-        3. Restoring while other instances are running causes race conditions
+        The user's own ``mcp.json`` (if any) is carried into the session home,
+        merged with the CAO profile's servers when the profile declares any;
+        on a name collision the CAO session profile wins. The source home is
+        never modified.
 
-        issue #494: ``_build_kimi_command`` (the sole caller) now runs inside
-        ``asyncio.to_thread``, so N concurrent inits can enter this method in N
-        threads at once. ``_KIMI_CONFIG_WRITE_LOCK`` serializes the whole
-        check-then-act (class flag + read-modify-write) so only one thread ever
-        touches ``config.toml`` at a time -- in-process only: a second
-        cao-server process, or the ``kimi`` CLI itself, writing between our read
-        and ``os.replace`` is still a last-writer-wins lost update. The write
-        itself is atomic (tmp file + ``os.replace``) so a concurrent reader
-        (e.g. a ``kimi`` process starting up) never sees a torn/partial file.
+        Args:
+            mcp_servers: The CAO agent profile's ``mcpServers`` mapping, or
+                None/empty when the profile declares none (the user's own
+                ``mcp.json`` is still carried over, unmodified).
+
+        Returns:
+            Absolute path of the session-local Kimi home.
+
+        Raises:
+            ProviderError: If an existing user ``mcp.json`` cannot be parsed.
         """
-        with _KIMI_CONFIG_WRITE_LOCK:
-            if cls._mcp_timeout_configured:
-                return
+        source_home = os.environ.get("KIMI_CODE_HOME") or str(Path.home() / ".kimi-code")
+        session_home = os.path.join(self._temp_dir, "kimi-home")
+        os.makedirs(session_home, mode=0o700, exist_ok=True)
 
-            config_path = Path.home() / ".kimi" / "config.toml"
-            if not config_path.exists():
-                logger.warning(
-                    f"Kimi config not found at {config_path}, skipping MCP timeout override"
-                )
-                cls._mcp_timeout_configured = True
-                return
-
+        # config.toml carries the user's provider/model config — including,
+        # on this machine, an inlined api_key (providers.<name>.api_key, which
+        # Kimi treats as highest-precedence). A copy would leave a secret
+        # residue in /tmp whenever session teardown skips provider.cleanup()
+        # (cao shutdown does not guarantee it), so it is SYMLINKED to the
+        # user's real config instead: the session shares the user's identity
+        # and model configuration, and only CAO-managed runtime state is
+        # isolated.
+        #
+        # Rename semantics (verified against kimi 0.34): kimi persists config
+        # with atomicWrite (tmp file + rename), and rename over a symlink
+        # REPLACES the symlink — it does not write through. So a kimi
+        # management operation inside the session (/model, /provider, config
+        # catalog import) swaps the session symlink for a regular file, and
+        # the api_key then exists as a plain file under /tmp. The USER's real
+        # config is never touched by this — the risk is a silent session
+        # detach plus a /tmp secret residue, NOT corruption of the user file.
+        # Ordinary boots never rewrite config.toml (verified), and CAO workers
+        # never invoke kimi management commands; the residue, when it does
+        # occur, is removed with the temp dir by provider.cleanup() (the
+        # cao shutdown gap is a pre-existing harness limitation).
+        config_src = os.path.join(source_home, "config.toml")
+        config_dst = os.path.join(session_home, "config.toml")
+        if os.path.exists(config_src) and not os.path.lexists(config_dst):
             try:
-                content = config_path.read_text()
+                os.symlink(config_src, config_dst)
+            except OSError as exc:
+                raise ProviderError(
+                    f"Cannot symlink {config_src} into the session Kimi home: {exc}"
+                )
 
-                # Match the existing timeout line under [mcp.client] section
-                # Format: tool_call_timeout_ms = 60000
-                pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
-                match = re.search(pattern, content)
-                if match:
-                    current_value = int(match.group(2))
-                    if current_value < 600000:
-                        new_content = re.sub(pattern, r"\g<1>600000", content)
-                        existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
-                        tmp_path = config_path.with_suffix(".toml.tmp")
-                        with open(tmp_path, "w") as f:
-                            f.write(new_content)
-                        os.chmod(tmp_path, existing_mode)
-                        os.replace(tmp_path, config_path)
-                        logger.info(
-                            f"Set MCP tool_call_timeout_ms to 600000 "
-                            f"(was {current_value}) in {config_path}"
-                        )
+        # Small read-only runtime files: copied (private per-session copies).
+        # sessions/, logs/, user-history/ and updates/ are NOT copied.
+        for name in ("tui.toml", "AGENTS.md"):
+            src = os.path.join(source_home, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(session_home, name))
+
+        # Credentials: symlink the user's REAL credentials store — created
+        # first if absent (kimi's expected layout is
+        # <home>/credentials/{user,rest,mcp}/…). OAuth/token files must land
+        # in the user's home (token refresh writes in place, exactly as a
+        # normal user-run kimi would); a copied credential set — or a session
+        # that lets kimi create fresh credential files under /tmp — would
+        # linger whenever session teardown skips provider.cleanup(). The
+        # symlink is the ONE piece of runtime data deliberately allowed to
+        # write back to the source Kimi home. Fail CLOSED if the link cannot
+        # be created: a copy fallback would re-introduce exactly the /tmp
+        # secret residue this design removes.
+        credentials_dir = os.path.join(source_home, "credentials")
+        try:
+            os.makedirs(credentials_dir, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise ProviderError(
+                f"Cannot prepare credentials store {credentials_dir} in the "
+                f"source Kimi home: {exc}"
+            )
+        credentials_link = os.path.join(session_home, "credentials")
+        if not os.path.lexists(credentials_link):
+            try:
+                os.symlink(credentials_dir, credentials_link)
+            except OSError as exc:
+                raise ProviderError(
+                    f"Cannot symlink credentials store {credentials_dir} into "
+                    f"the session Kimi home: {exc}"
+                )
+
+        # plugins/ and skills/: kimi treats these as managed stores — its
+        # registry file (plugins/installed.json: enabled state + MCP
+        # capabilities) is mutable state that a session must never write back
+        # to the user's home, so it is COPIED into a real (isolated) session
+        # directory. The remaining entries are plugin/skill PAYLOADS, shared
+        # by symlink under a read-only assumption: CAO never writes them. If
+        # an individual plugin itself writes state into its own payload
+        # directory, that write would land in the user's home — that is
+        # unverified third-party behavior, not a CAO write path.
+        for name in ("plugins", "skills"):
+            src = os.path.join(source_home, name)
+            dst = os.path.join(session_home, name)
+            if not os.path.isdir(src) or os.path.lexists(dst):
+                continue
+            os.makedirs(dst)
+            for entry in os.listdir(src):
+                entry_src = os.path.join(src, entry)
+                entry_dst = os.path.join(dst, entry)
+                if entry == "installed.json":
+                    shutil.copy2(entry_src, entry_dst)
+                    continue
+                try:
+                    os.symlink(entry_src, entry_dst)
+                except OSError:
+                    if os.path.isdir(entry_src):
+                        shutil.copytree(entry_src, entry_dst)
+                    else:
+                        shutil.copy2(entry_src, entry_dst)
+
+        # bin/: kimi's own bundled binaries — read-only payload, symlink only.
+        bin_src = os.path.join(source_home, "bin")
+        bin_dst = os.path.join(session_home, "bin")
+        if os.path.isdir(bin_src) and not os.path.lexists(bin_dst):
+            try:
+                os.symlink(bin_src, bin_dst)
+            except OSError:
+                shutil.copytree(bin_src, bin_dst)
+
+        # Carry the user's mcp.json into the session home, merged with the
+        # CAO profile's servers when the profile declares any (name collision:
+        # the CAO session profile wins). mcp.json is only written when there
+        # is content — a profile without MCP servers and no user mcp.json
+        # leaves kimi to manage its own (isolated) MCP state.
+        source_mcp = os.path.join(source_home, "mcp.json")
+        merged: Optional[Dict[str, Any]] = None
+        if os.path.exists(source_mcp):
+            try:
+                with open(source_mcp, "r", encoding="utf-8") as f:
+                    user_mcp = json.load(f)
+            except (OSError, ValueError) as e:
+                raise ProviderError(
+                    f"Existing Kimi MCP config at {source_mcp} could not be parsed: {e}"
+                )
+            if not isinstance(user_mcp, dict):
+                raise ProviderError(
+                    f"Existing Kimi MCP config at {source_mcp} is not a JSON object"
+                )
+            # Preserve non-mcpServers top-level keys; never modify the source.
+            merged = dict(user_mcp)
+            if not isinstance(merged.get("mcpServers", {}), dict):
+                raise ProviderError(
+                    f"Existing Kimi MCP config at {source_mcp} has an invalid "
+                    "'mcpServers' section"
+                )
+            merged.setdefault("mcpServers", {})
+
+        if mcp_servers:
+            if merged is None:
+                merged = {"mcpServers": {}}
+            for server_name, server_config in mcp_servers.items():
+                if isinstance(server_config, dict):
+                    resolved = dict(server_config)
                 else:
-                    logger.warning(
-                        f"tool_call_timeout_ms not found in {config_path}, "
-                        "MCP tool calls may time out during handoff"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
+                    resolved = server_config.model_dump(exclude_none=True)
 
-            cls._mcp_timeout_configured = True
+                # Resolve the bundled cao-mcp-server console script to a
+                # PATH-independent invocation.
+                resolved = resolve_mcp_server_config(resolved)
+
+                # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
+                # can identify the current terminal for handoff/assign
+                # operations. Kimi CLI does not automatically forward parent
+                # shell env vars to MCP subprocesses, so we inject it
+                # explicitly via the env field.
+                env = resolved.get("env", {})
+                if "CAO_TERMINAL_ID" not in env:
+                    env["CAO_TERMINAL_ID"] = self.terminal_id
+                    resolved["env"] = env
+
+                # An explicit CAO session profile overrides the user default.
+                merged["mcpServers"][server_name] = resolved
+
+        if merged is not None:
+            mcp_path = os.path.join(session_home, "mcp.json")
+            with open(mcp_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=2)
+            os.chmod(mcp_path, 0o600)
+
+        return session_home
 
     async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
@@ -527,6 +646,7 @@ class KimiCliProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         upgrade_dismissed = False
+        trust_dismissed = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -539,6 +659,43 @@ class KimiCliProvider(BaseProvider):
             )
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                # Answer the folder-trust dialog once; its text lingers in the
+                # buffer after dismissal, so the flag stops a re-answer.
+                if not trust_dismissed and re.search(TRUST_PROMPT_PATTERN, clean_output):
+                    # Auto-accepting "Trust this folder" escalates workspace
+                    # trust, so it is governed by an explicit SERVER SETTING
+                    # (kimi_auto_trust_workspaces), NOT by the session's
+                    # allowed_tools: CAO already treats Kimi workers as
+                    # unrestricted (SOFT_ENFORCEMENT_PROVIDERS logs "treat
+                    # this worker as unrestricted" and the CLI is always
+                    # launched with --yolo), so a tool-restricted session must
+                    # still be able to boot. With the setting disabled, leave
+                    # the dialog unanswered (init then fails safe on its
+                    # timeout) rather than escalating trust.
+                    if not get_server_settings()["kimi_auto_trust_workspaces"]:
+                        logger.warning(
+                            "Kimi folder-trust dialog detected but "
+                            "kimi_auto_trust_workspaces is disabled; NOT "
+                            "auto-trusting the workspace. Kimi 0.34 cannot "
+                            "boot untrusted folders headlessly."
+                        )
+                        return
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Kimi folder-trust dialog detected, accepting 'Trust this folder'")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    # Default selection is "Trust this folder": a plain Enter.
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Enter",
+                    )
+                    trust_dismissed = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
+                    await asyncio.sleep(1.0)
+                    continue
                 # Answer the upgrade dialog once; its text lingers in the buffer
                 # after dismissal, so the flag stops a re-answer on later polls.
                 if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
@@ -582,10 +739,10 @@ class KimiCliProvider(BaseProvider):
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
 
         issue #494: ``_build_kimi_command`` does blocking file I/O (mkdtemp,
-        writing system.md/agent.yaml, and the ~/.kimi/config.toml
-        read-modify-write via ``_ensure_mcp_timeout``) and ``get_backend().
-        send_keys`` is a blocking subprocess exec -- both offloaded to a
-        worker thread via ``asyncio.to_thread`` for the same reason as
+        writing agent.md and the session-local kimi-home/mcp.json) and
+        ``get_backend().send_keys`` is a blocking subprocess exec -- both
+        offloaded to a worker thread via ``asyncio.to_thread`` for the same
+        reason as
         ``_handle_startup_dialog`` (see its docstring): so nothing in
         initialize() blocks the shared event loop under concurrent session
         creation.
@@ -727,7 +884,40 @@ class KimiCliProvider(BaseProvider):
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
             if spinner_in_tail or last_spinner > last_bullet:
-                return TerminalStatus.PROCESSING
+                # Stream looks busy — but the RENDERED pane is authoritative
+                # once a dispatch has happened: tmux's compositor has resolved
+                # every in-place redraw, so a spinner glyph still visible in
+                # the pane tail is live, not stale. Measured live on kimi
+                # 0.34: the last "working…" frame renders BELOW the response
+                # bullets (screen-bottom spinner), so a FINISHED turn
+                # legitimately ends with spinner-after-bullet in the stream
+                # while the pane is already back at the ready chrome (input
+                # box + status bar + context footer). Without this pane
+                # confirmation such a terminal is pinned at PROCESSING
+                # forever — no further chunks arrive, so no quiescence
+                # re-detection ever runs (the pre-dispatch boot screens are
+                # unaffected: no dispatch yet → stream signal wins).
+                if self._last_dispatch_time:
+                    try:
+                        pane_tail = get_backend().get_history(
+                            self.session_name,
+                            self.window_name,
+                            tail_lines=25,
+                            strip_escapes=True,
+                        )
+                        pane_has_spinner = any(
+                            _is_live_turn_spinner_line(line) for line in pane_tail.splitlines()
+                        )
+                    except Exception:
+                        # Pane unavailable (deleted window, backend hiccup) —
+                        # trust the stream's busy signal.
+                        pane_has_spinner = True
+                    if pane_has_spinner:
+                        return TerminalStatus.PROCESSING
+                    # Pane is at the ready chrome — the stream spinner is
+                    # stale; fall through to the ready-path checks below.
+                else:
+                    return TerminalStatus.PROCESSING
 
             # Dispatch grace: for a few seconds after send_input(), trust the
             # dispatch over the chrome. The paste repaints the status bar

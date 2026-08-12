@@ -4,11 +4,12 @@ Covers initialization, status detection, message extraction, command building,
 pattern matching, and cleanup — targeting >90% code coverage.
 """
 
+import json
 import os
 import re
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -29,6 +30,17 @@ from cli_agent_orchestrator.providers.kimi_cli import (
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kimi_home(monkeypatch, tmp_path):
+    """Every test in this file must be hermetic: no real KIMI_CODE_HOME env,
+    and Path.home() redirected to the test's tmp dir. The provider now always
+    materializes a session-local Kimi home (config/credentials symlinks), so
+    without this the unit tests would create directories under the real
+    ~/.kimi-code."""
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
 
 def _read_fixture(name: str) -> str:
@@ -140,9 +152,9 @@ class TestKimiCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     async def test_initialize_with_mcp_servers(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, monkeypatch, tmp_path
     ):
-        """Test initialization with MCP servers in profile adds --mcp-config and modifies config.toml."""
+        """Test initialization with MCP servers wires a session-local KIMI_CODE_HOME."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_profile = MagicMock()
@@ -156,21 +168,28 @@ class TestKimiCliProviderInitialization:
         }
         mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
+        monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
 
         with patch(
             "cli_agent_orchestrator.providers.kimi_cli.Path.home",
-            return_value=Path(tempfile.mkdtemp()),
+            return_value=tmp_path,
         ):
             result = await provider.initialize()
         assert result is True
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "--mcp-config" in command
-        # No --config flag in command (breaks OAuth authentication)
+        # New Kimi Code: MCP overlay via KIMI_CODE_HOME, never --mcp-config
+        assert "--mcp-config" not in command
+        assert "KIMI_CODE_HOME=" in command
+        assert "KIMI_MCP_TOOL_TIMEOUT_MS=600000" in command
+        # No --config flag either (legacy workaround, now removed)
         assert "--config" not in command
+        provider.cleanup()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
@@ -179,7 +198,7 @@ class TestKimiCliProviderInitialization:
     async def test_initialize_sends_kimi_command(
         self, mock_tmux, mock_wait_shell, mock_wait_status
     ):
-        """Test that initialize sends the kimi --yolo command with cd and TERM override."""
+        """Test that initialize sends the kimi --yolo command without cd and with TERM override."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
 
@@ -188,10 +207,116 @@ class TestKimiCliProviderInitialization:
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "cd " in command
+        # CAO owns cwd: the command must never cd into the provider temp dir
+        assert "cd " not in command
         assert "TERM=xterm-256color" in command
         assert "kimi --yolo" in command
         provider.cleanup()
+
+
+class TestKimiCliFolderTrustDialog:
+    """Kimi Code 0.34's "Trust this folder?" boot dialog must be dismissed
+    headlessly, or init can never reach IDLE (observed in the real E2E: CAO
+    worktrees are never in the user's trust list, and the dialog blocks the
+    whole boot). Verified on 0.34: "Don't trust" makes kimi refuse to run in
+    the folder (clean exit), so CAO accepts the default "Trust this folder"
+    with a plain Enter — governed by the kimi_auto_trust_workspaces SERVER
+    SETTING (default true), deliberately decoupled from the session's
+    allowed_tools: CAO already treats Kimi workers as unrestricted
+    (SOFT_ENFORCEMENT_PROVIDERS logs "treat this worker as unrestricted"),
+    so a tool-restricted worker must still be able to boot. With the setting
+    disabled, the dialog is left unanswered and init fails safe."""
+
+    def _settings():
+        return {
+            "startup_prompt_handler_timeout": 20,
+            "provider_init_timeout": 60,
+            "kimi_auto_trust_workspaces": True,
+        }
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.time")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    async def test_accepts_folder_trust(self, mock_get_backend, mock_time, mock_sleep):
+        mock_backend = MagicMock()
+        mock_get_backend.return_value = mock_backend
+        mock_time.monotonic.side_effect = [
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: trust dialog detected
+            5.0,  # last_prompt_time reset
+            6.0,  # iter2: ready prompt → return
+        ]
+        mock_backend.get_history.side_effect = [
+            "Trust this folder?\n"
+            "↑↓ navigate · Enter select · Esc exit\n"
+            "❯ Trust this folder\n"
+            "  Don't trust\n"
+            "  Exit Kimi Code. Asked again next launch.",
+            "yolo  agent (kimi ●)  /tmp/x\ncontext: 4.0%",
+        ]
+
+        # allowed_tools is IRRELEVANT here: the gate is the server setting,
+        # not the session's tool policy (a restricted kimi worker still boots).
+        p = KimiCliProvider("t1", "sess", "win", allowed_tools=["execute_bash", "fs_read"])
+        with (
+            patch.object(p, "get_status", return_value=TerminalStatus.IDLE),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor") as mock_monitor,
+        ):
+            await p._handle_startup_dialog()
+
+        # Accept the default "Trust this folder": a single Enter, nothing else.
+        assert mock_backend.send_special_key.call_args_list == [call("sess", "win", "Enter")]
+        assert mock_backend.send_keys.call_count == 0  # no other key sent
+        mock_monitor.notify_input_sent.assert_called_once_with("t1")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.time")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    async def test_auto_trust_disabled_setting_blocks(
+        self, mock_get_backend, mock_time, mock_sleep
+    ):
+        """kimi_auto_trust_workspaces=false: no key is sent — init fails safe
+        instead of auto-escalating workspace trust."""
+        mock_backend = MagicMock()
+        mock_get_backend.return_value = mock_backend
+        mock_time.monotonic.side_effect = [
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: trust dialog detected → setting off → return
+        ]
+        mock_backend.get_history.return_value = (
+            "Trust this folder?\n"
+            "↑↓ navigate · Enter select · Esc exit\n"
+            "❯ Trust this folder\n"
+            "  Don't trust\n"
+            "  Exit Kimi Code. Asked again next launch."
+        )
+
+        def _settings_disabled():
+            return {
+                "startup_prompt_handler_timeout": 20,
+                "provider_init_timeout": 60,
+                "kimi_auto_trust_workspaces": False,
+            }
+
+        p = KimiCliProvider("t1", "sess", "win")
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.kimi_cli.get_server_settings",
+                _settings_disabled,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor") as mock_monitor,
+        ):
+            await p._handle_startup_dialog()
+
+        assert mock_backend.send_special_key.call_count == 0
+        assert mock_backend.send_keys.call_count == 0
+        mock_monitor.notify_input_sent.assert_not_called()
 
 
 # =============================================================================
@@ -549,12 +674,17 @@ class TestKimiCliProviderBuildCommand:
     """Tests for KimiCliProvider._build_kimi_command()."""
 
     def test_build_command_no_profile(self):
-        """Test command without agent profile includes cd, TERM override, and kimi --yolo."""
+        """Test command without agent profile: no cd, TERM override, kimi --yolo."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         command = provider._build_kimi_command()
-        assert "cd " in command
+        # CAO owns cwd: the command must never cd into the provider temp dir
+        assert "cd " not in command
         assert "TERM=xterm-256color" in command
         assert "kimi --yolo" in command
+        assert "KIMI_MCP_TOOL_TIMEOUT_MS=600000" in command
+        # The session-local Kimi home is ALWAYS enabled (no profile either),
+        # so kimi never writes runtime state into the user's real home.
+        assert "KIMI_CODE_HOME=" in command
         assert provider._temp_dir is not None
         provider.cleanup()
 
@@ -580,8 +710,45 @@ class TestKimiCliProviderBuildCommand:
         provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_with_mcp_config(self, mock_load, tmp_path):
-        """Test command with MCP server configuration including CAO_TERMINAL_ID injection."""
+    def test_build_command_writes_agent_md(self, mock_load):
+        """New-style Markdown agent file: agent.md with ${base_prompt}, no legacy YAML."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "Custom system prompt"
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        command = provider._build_kimi_command()
+
+        # agent.md exists; legacy indirection files are gone
+        assert provider._temp_dir is not None
+        agent_md = os.path.join(provider._temp_dir, "agent.md")
+        assert os.path.exists(agent_md)
+        assert not os.path.exists(os.path.join(provider._temp_dir, "agent.yaml"))
+        assert not os.path.exists(os.path.join(provider._temp_dir, "system.md"))
+
+        with open(agent_md, encoding="utf-8") as f:
+            content = f.read()
+        assert content.startswith("---\n")
+        assert "name: cao-agent" in content
+        assert "description: CAO-managed Kimi Code agent" in content
+        # ${base_prompt} kept as a literal for Kimi's template expansion
+        assert "${base_prompt}" in content
+        assert "Custom system prompt" in content
+
+        assert f"--agent-file {agent_md}" in command
+
+        # Cleanup
+        provider.cleanup()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_with_mcp_config(self, mock_load, monkeypatch, tmp_path):
+        """MCP servers land in the session-local kimi-home/mcp.json, not --mcp-config."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -589,23 +756,31 @@ class TestKimiCliProviderBuildCommand:
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        command = provider._build_kimi_command()
 
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            command = provider._build_kimi_command()
+        assert "--mcp-config" not in command
+        assert "KIMI_CODE_HOME=" in command
+        assert "KIMI_MCP_TOOL_TIMEOUT_MS=600000" in command
 
-        assert "--mcp-config" in command
-        assert "test-server" in command
-        # CAO_TERMINAL_ID should be injected into MCP server env
-        assert "CAO_TERMINAL_ID" in command
-        assert "term-1" in command
-        # No --config flag (modifies config.toml directly to avoid breaking OAuth)
-        assert "--config" not in command
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        # CAO_TERMINAL_ID is injected into the MCP server env
+        env = config["mcpServers"]["test-server"]["env"]
+        assert env["CAO_TERMINAL_ID"] == "term-1"
+        # Source home untouched
+        assert not (user_home / "mcp.json").exists()
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_resolves_bundled_mcp_command(self, mock_load, tmp_path):
+    def test_build_command_resolves_bundled_mcp_command(self, mock_load, monkeypatch, tmp_path):
         """The bare cao-mcp-server command is resolved to a PATH-independent
-        invocation in the emitted --mcp-config JSON (wiring guard: a refactor
-        that drops the resolve_mcp_server_config call must fail this test)."""
+        invocation in the session mcp.json (wiring guard: a refactor that
+        drops the resolve_mcp_server_config call must fail this test)."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -617,48 +792,24 @@ class TestKimiCliProviderBuildCommand:
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         MOD = "cli_agent_orchestrator.utils.mcp_resolution"
         with (
-            patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path),
             patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
             patch(f"{MOD}.shutil.which", return_value=None),
         ):
-            command = provider._build_kimi_command()
+            provider._build_kimi_command()
 
-        assert "/venv/bin/cao-mcp-server" in command
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        assert config["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
         provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_creates_agent_yaml(self, mock_load):
-        """Test that agent YAML and system prompt files are created correctly."""
-        mock_profile = MagicMock()
-        mock_profile.model = None
-        mock_profile.system_prompt = "Custom system prompt"
-        mock_profile.mcpServers = None
-        mock_load.return_value = mock_profile
+    def test_build_command_with_pydantic_mcp_config(self, mock_load, monkeypatch, tmp_path):
+        """Test MCP servers as Pydantic model objects land in session mcp.json."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
 
-        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        provider._build_kimi_command()
-
-        # Check temp files were created
-        assert provider._temp_dir is not None
-        assert os.path.exists(os.path.join(provider._temp_dir, "agent.yaml"))
-        assert os.path.exists(os.path.join(provider._temp_dir, "system.md"))
-
-        # Check system prompt content
-        with open(os.path.join(provider._temp_dir, "system.md")) as f:
-            assert f.read() == "Custom system prompt"
-
-        # Check agent YAML content
-        with open(os.path.join(provider._temp_dir, "agent.yaml")) as f:
-            content = f.read()
-            assert "extend: default" in content
-            assert "system_prompt_path: ./system.md" in content
-
-        # Cleanup
-        provider.cleanup()
-
-    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_with_pydantic_mcp_config(self, mock_load):
-        """Test command with MCP servers as Pydantic model objects."""
         mock_server = MagicMock()
         mock_server.model_dump.return_value = {"command": "node", "args": ["server.js"]}
         # Not a dict, triggers model_dump branch
@@ -673,14 +824,21 @@ class TestKimiCliProviderBuildCommand:
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_kimi_command()
 
-        assert "--mcp-config" in command
-        assert "my-server" in command
-        # CAO_TERMINAL_ID should be injected into MCP server env
-        assert "CAO_TERMINAL_ID" in command
+        assert "--mcp-config" not in command
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        assert config["mcpServers"]["my-server"]["command"] == "node"
+        assert config["mcpServers"]["my-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_preserves_existing_env(self, mock_load):
+    def test_build_command_mcp_preserves_existing_env(self, mock_load, monkeypatch, tmp_path):
         """Test that CAO_TERMINAL_ID injection preserves existing env vars."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -694,21 +852,25 @@ class TestKimiCliProviderBuildCommand:
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("abc123", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_kimi_command()
+        provider._build_kimi_command()
 
-        import json
-
-        # Extract the JSON config from the command
-        parts = command.split("--mcp-config ")
-        mcp_json = parts[1].strip().strip("'")
-        config = json.loads(mcp_json)
-
-        assert config["test-server"]["env"]["MY_VAR"] == "my_value"
-        assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "abc123"
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        env = config["mcpServers"]["test-server"]["env"]
+        assert env["MY_VAR"] == "my_value"
+        assert env["CAO_TERMINAL_ID"] == "abc123"
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
+    def test_build_command_mcp_does_not_override_existing_terminal_id(
+        self, mock_load, monkeypatch, tmp_path
+    ):
         """Test that existing CAO_TERMINAL_ID in env is not overwritten."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -722,160 +884,203 @@ class TestKimiCliProviderBuildCommand:
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("new-id", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_kimi_command()
+        provider._build_kimi_command()
 
-        import json
-
-        parts = command.split("--mcp-config ")
-        mcp_json = parts[1].strip().strip("'")
-        config = json.loads(mcp_json)
-
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            config = json.load(f)
         # Should keep the existing value, not override
-        assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "existing-id"
+        assert config["mcpServers"]["test-server"]["env"]["CAO_TERMINAL_ID"] == "existing-id"
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_tool_timeout(self, mock_load, tmp_path):
-        """Test that MCP tool timeout is set to 600s in config.toml when MCP servers present.
+    def test_build_command_merges_existing_user_mcp_json(self, mock_load, monkeypatch, tmp_path):
+        """The user's own mcp.json is preserved and merged, source untouched."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        (user_home / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"existing-server": {"command": "npx", "args": ["-y", "srv"]}},
+                    "customTopLevel": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
 
-        Uses class-level flag to ensure config is modified only once per process,
-        avoiding race conditions when multiple workers are created in parallel.
-        """
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
-            "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         }
         mock_load.return_value = mock_profile
-
-        # Create a fake config.toml
-        fake_kimi_dir = tmp_path / ".kimi"
-        fake_kimi_dir.mkdir()
-        config_file = fake_kimi_dir / "config.toml"
-        config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
-
-        # Reset class-level flag so test runs the config modification
-        KimiCliProvider._mcp_timeout_configured = False
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            provider._build_kimi_command()
 
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            command = provider._build_kimi_command()
-
-        # No --config flag in command (breaks OAuth)
-        assert "--config" not in command
-        # Config file should be updated to 600000
-        assert "tool_call_timeout_ms = 600000" in config_file.read_text()
-        # Class-level flag should be set
-        assert KimiCliProvider._mcp_timeout_configured is True
-
-        # Cleanup should NOT restore timeout (shared config, concurrent instances)
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            mcp = json.load(f)
+        # Both the user's server and the CAO profile's server are present
+        assert set(mcp["mcpServers"]) == {"existing-server", "cao-mcp-server"}
+        # Non-mcpServers top-level keys are preserved
+        assert mcp["customTopLevel"] is True
+        # Source user mcp.json is completely unchanged
+        source = json.loads((user_home / "mcp.json").read_text(encoding="utf-8"))
+        assert source == {
+            "mcpServers": {"existing-server": {"command": "npx", "args": ["-y", "srv"]}},
+            "customTopLevel": True,
+        }
         provider.cleanup()
-        assert "tool_call_timeout_ms = 600000" in config_file.read_text()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_timeout_only_once(self, mock_load, tmp_path):
-        """Test that config.toml is only modified once even with multiple instances."""
+    def test_build_command_profile_mcp_overrides_user_same_name(
+        self, mock_load, monkeypatch, tmp_path
+    ):
+        """On a name collision the CAO session profile wins over the user default."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        (user_home / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"cao-mcp-server": {"command": "user-copy"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
-            "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         }
         mock_load.return_value = mock_profile
 
-        fake_kimi_dir = tmp_path / ".kimi"
-        fake_kimi_dir.mkdir()
-        config_file = fake_kimi_dir / "config.toml"
-        config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            provider._build_kimi_command()
 
-        KimiCliProvider._mcp_timeout_configured = False
-
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            p1 = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-            p1._build_kimi_command()
-
-            # Manually reset config to 60000 to verify second call doesn't write
-            config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
-
-            p2 = KimiCliProvider("term-2", "session-1", "window-2", agent_profile="dev")
-            p2._build_kimi_command()
-
-        # Second instance should NOT have modified config (flag was already set)
-        assert "tool_call_timeout_ms = 60000" in config_file.read_text()
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            mcp = json.load(f)
+        assert mcp["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+        # Source user file unchanged
+        assert "user-copy" in (user_home / "mcp.json").read_text(encoding="utf-8")
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_no_timeout_without_mcp(self, mock_load, tmp_path):
-        """Test that MCP tool timeout is NOT modified when no MCP servers are configured."""
+    def test_build_command_invalid_user_mcp_json_raises(self, mock_load, monkeypatch, tmp_path):
+        """An unparseable user mcp.json must raise ProviderError, not be silently replaced."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        (user_home / "mcp.json").write_text("{not valid json", encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        with pytest.raises(ProviderError, match="could not be parsed"):
+            provider._build_kimi_command()
+        provider.cleanup()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_no_mcp_still_has_session_home(self, mock_load):
+        """A profile without MCP servers still gets the session-local Kimi
+        home (so kimi never writes workspace-trust/sessions/workspaces.json
+        into the user's real home); no mcp.json is written when neither the
+        profile nor the user has one."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are helpful"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
 
-        fake_kimi_dir = tmp_path / ".kimi"
-        fake_kimi_dir.mkdir()
-        config_file = fake_kimi_dir / "config.toml"
-        config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
-
-        KimiCliProvider._mcp_timeout_configured = False
-
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        command = provider._build_kimi_command()
 
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            command = provider._build_kimi_command()
-
-        # Config file should remain unchanged
-        assert "tool_call_timeout_ms = 60000" in config_file.read_text()
+        assert "--agent-file" in command
+        assert "KIMI_CODE_HOME=" in command
+        assert "KIMI_MCP_TOOL_TIMEOUT_MS=600000" in command
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        assert not os.path.exists(os.path.join(session_home, "mcp.json"))
         provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_mcp_timeout_config_missing(self, mock_load, tmp_path):
-        """Test graceful handling when ~/.kimi/config.toml doesn't exist."""
+    def test_build_command_no_profile_mcp_carries_user_mcp_json(
+        self, mock_load, monkeypatch, tmp_path
+    ):
+        """No profile MCP servers + a user mcp.json: the user's MCP config is
+        carried into the session home UNMODIFIED (no CAO overlay, no
+        CAO_TERMINAL_ID injection) and the source file is untouched."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        (user_home / "mcp.json").write_text(
+            json.dumps(
+                {"mcpServers": {"existing-server": {"command": "npx", "args": ["-y", "srv"]}}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
-        mock_profile.mcpServers = {
-            "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
-        }
+        mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
 
-        KimiCliProvider._mcp_timeout_configured = False
-
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        provider._build_kimi_command()
 
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            command = provider._build_kimi_command()
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        with open(os.path.join(session_home, "mcp.json"), encoding="utf-8") as f:
+            mcp = json.load(f)
+        assert mcp["mcpServers"]["existing-server"]["command"] == "npx"
+        assert "CAO_TERMINAL_ID" not in mcp["mcpServers"]["existing-server"].get("env", {})
+        assert "CAO_TERMINAL_ID" not in json.dumps(mcp)
+        # Source unchanged.
+        assert "npx" in (user_home / "mcp.json").read_text(encoding="utf-8")
+        provider.cleanup()
 
-        # Should still produce a valid command
-        assert "kimi --yolo" in command
-        assert "--mcp-config" in command
+    def test_build_command_sets_timeout_env_var(self):
+        """Timeout is process-local: KIMI_MCP_TOOL_TIMEOUT_MS is always set."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        command = provider._build_kimi_command()
+        assert "KIMI_MCP_TOOL_TIMEOUT_MS=600000" in command
+        provider.cleanup()
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_mcp_timeout_already_high(self, mock_load, tmp_path):
-        """Test that timeout is not downgraded if already >= 600000."""
-        mock_profile = MagicMock()
-        mock_profile.model = None
-        mock_profile.system_prompt = None
-        mock_profile.mcpServers = {
-            "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
-        }
-        mock_load.return_value = mock_profile
+    def test_build_command_does_not_touch_user_configs(self, monkeypatch, tmp_path):
+        """No user config file is modified: neither legacy ~/.kimi nor ~/.kimi-code."""
+        user_home = tmp_path / ".kimi-code"
+        user_home.mkdir()
+        legacy_kimi = tmp_path / ".kimi"
+        legacy_kimi.mkdir()
+        user_config = user_home / "config.toml"
+        user_config.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n", encoding="utf-8")
+        legacy_config = legacy_kimi / "config.toml"
+        legacy_config.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n", encoding="utf-8")
 
-        fake_kimi_dir = tmp_path / ".kimi"
-        fake_kimi_dir.mkdir()
-        config_file = fake_kimi_dir / "config.toml"
-        config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 900000\n")
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        command = provider._build_kimi_command()
 
-        KimiCliProvider._mcp_timeout_configured = False
-
-        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            provider._build_kimi_command()
-
-        # Should NOT downgrade an already-high timeout
-        assert "tool_call_timeout_ms = 900000" in config_file.read_text()
+        assert "KIMI_MCP_TOOL_TIMEOUT_MS=600000" in command
+        assert "tool_call_timeout_ms = 60000" in user_config.read_text(encoding="utf-8")
+        assert "tool_call_timeout_ms = 60000" in legacy_config.read_text(encoding="utf-8")
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_profile_no_system_prompt(self, mock_load):
@@ -910,6 +1115,310 @@ class TestKimiCliProviderBuildCommand:
         assert "--agent-file" not in command
         assert provider._temp_dir is not None
         provider.cleanup()
+
+
+class TestKimiSessionHomeIsolation:
+    """Secret/state lifecycle of the session-local Kimi home:
+
+    - credentials/ is SYMLINKED to the user's real store (token refresh must
+      write back to the user's own home; a /tmp copy would linger whenever
+      session teardown skips provider.cleanup()).
+    - plugins/ and skills/ are REAL (isolated) directories: mutable metadata
+      (installed.json) is copied, only read-only payload entries are
+      symlinked — a session can never write back to the user's store.
+    - bin/ (bundled binaries, read-only) is symlinked; AGENTS.md (small,
+      read-only guidance) is copied.
+    """
+
+    def _provider_with_home(self, user_home):
+        with patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile") as mock_load:
+            mock_profile = MagicMock()
+            mock_profile.model = None
+            mock_profile.system_prompt = None
+            mock_profile.mcpServers = {
+                "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+            }
+            mock_load.return_value = mock_profile
+            provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+            with (
+                patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+                patch(f"{MOD}.shutil.which", return_value=None),
+            ):
+                provider._build_kimi_command()
+            return provider
+
+    def test_credentials_symlinked_not_copied(self, monkeypatch, tmp_path):
+        """The /tmp session home must never hold a credential FILE copy."""
+        user_home = tmp_path / "user-kimi-home"
+        creds = user_home / "credentials"
+        creds.mkdir(parents=True)
+        (creds / "user.json").write_text('{"token": "sensitive"}', encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+        link = os.path.join(provider._temp_dir, "kimi-home", "credentials")
+        # Symlink to the user's real store — not a copy.
+        assert os.path.islink(link)
+        assert os.readlink(link) == str(creds)
+        assert os.path.realpath(link) == str(creds)
+        # Read-through works (kimi token refresh writes in place in source).
+        assert (Path(link) / "user.json").read_text(encoding="utf-8").startswith('{"token"')
+        provider.cleanup()
+
+    def test_credentials_symlink_failure_raises_provider_error(self, monkeypatch, tmp_path):
+        """Fail CLOSED: if the credentials symlink cannot be created, raise
+        ProviderError — never fall back to a copy that would leave a /tmp
+        secret residue."""
+        user_home = tmp_path / "user-kimi-home"
+        creds = user_home / "credentials"
+        creds.mkdir(parents=True)
+        (creds / "user.json").write_text('{"token": "sensitive"}', encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        real_symlink = os.symlink
+
+        def _fail_credentials_symlink(src, dst):
+            if str(dst).endswith("credentials"):
+                raise OSError("no")
+            return real_symlink(src, dst)
+
+        with (
+            patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile") as mock_load,
+            patch(
+                "cli_agent_orchestrator.providers.kimi_cli.os.symlink",
+                side_effect=_fail_credentials_symlink,
+            ),
+        ):
+            mock_profile = MagicMock()
+            mock_profile.model = None
+            mock_profile.system_prompt = None
+            mock_profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+            mock_load.return_value = mock_profile
+            with pytest.raises(ProviderError, match="Cannot symlink credentials store"):
+                provider._build_kimi_command()
+
+        # No credentials copy was created in the session home.
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        assert not os.path.lexists(os.path.join(session_home, "credentials"))
+        provider.cleanup()
+
+    def test_config_toml_symlinked_not_copied(self, monkeypatch, tmp_path):
+        """config.toml may carry an inlined api_key, so it is SYMLINKED to the
+        user's real file — no /tmp copy, no secret residue."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        config = user_home / "config.toml"
+        config.write_text(
+            '[providers.fake]\napi_key = "SUPER_SECRET_TEST_VALUE"\n', encoding="utf-8"
+        )
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+        session_config = os.path.join(provider._temp_dir, "kimi-home", "config.toml")
+        assert os.path.islink(session_config)
+        assert os.path.realpath(session_config) == str(config)
+        provider.cleanup()
+
+    def test_no_secret_in_session_regular_files(self, monkeypatch, tmp_path):
+        """The session temp dir must not contain the api_key inside any
+        REGULAR file (symlinks point at the user's home and are excluded).
+        This is the merge gate for secret isolation."""
+        secret = "SUPER_SECRET_TEST_VALUE"
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        (user_home / "config.toml").write_text(
+            f'[providers.fake]\napi_key = "{secret}"\n', encoding="utf-8"
+        )
+        creds = user_home / "credentials"
+        creds.mkdir()
+        (creds / "user.json").write_text(f'{{"token": "{secret}"}}', encoding="utf-8")
+        (user_home / "tui.toml").write_text("theme = 'light'\n", encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+
+        temp_dir = provider._temp_dir
+        hits = []
+        for root, _dirs, files in os.walk(temp_dir):
+            for fname in files:
+                path = os.path.join(root, fname)
+                if os.path.islink(path):
+                    continue  # symlink → user's own home, not a copy
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        if secret in f.read():
+                            hits.append(path)
+                except OSError:
+                    pass
+        assert hits == [], f"secret found in session regular files: {hits}"
+        provider.cleanup()
+
+    def test_plugins_metadata_copied_payload_symlinked(self, monkeypatch, tmp_path):
+        """plugins/ is isolated: installed.json is a real copy; plugin payload
+        directories are symlinks — session writes can never reach source."""
+        user_home = tmp_path / "user-kimi-home"
+        plugins = user_home / "plugins"
+        (plugins / "my-plugin").mkdir(parents=True)
+        (plugins / "installed.json").write_text('{"installed": ["my-plugin"]}', encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+        session_plugins = os.path.join(provider._temp_dir, "kimi-home", "plugins")
+        assert os.path.isdir(session_plugins)
+        assert not os.path.islink(session_plugins)  # isolated real dir
+        # Mutable registry: a real copy in the session home.
+        registry = os.path.join(session_plugins, "installed.json")
+        assert os.path.isfile(registry)
+        assert not os.path.islink(registry)
+        assert '{"installed": ["my-plugin"]}' in open(registry, encoding="utf-8").read()
+        # Read-only payload: symlink.
+        assert os.path.islink(os.path.join(session_plugins, "my-plugin"))
+        # Source registry unchanged.
+        assert '{"installed": ["my-plugin"]}' in (plugins / "installed.json").read_text(
+            encoding="utf-8"
+        )
+        provider.cleanup()
+
+    def test_skills_isolated_like_plugins(self, monkeypatch, tmp_path):
+        user_home = tmp_path / "user-kimi-home"
+        skills = user_home / "skills"
+        (skills / "reviewer").mkdir(parents=True)
+        (skills / "reviewer" / "SKILL.md").write_text("# reviewer", encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+        session_skills = os.path.join(provider._temp_dir, "kimi-home", "skills")
+        assert os.path.isdir(session_skills)
+        assert not os.path.islink(session_skills)
+        assert os.path.islink(os.path.join(session_skills, "reviewer"))
+        assert os.path.exists(os.path.join(session_skills, "reviewer", "SKILL.md"))
+        provider.cleanup()
+
+    def test_bin_symlinked_agents_md_copied(self, monkeypatch, tmp_path):
+        user_home = tmp_path / "user-kimi-home"
+        (user_home / "bin").mkdir(parents=True)
+        (user_home / "bin" / "kimi").write_text("#!/bin/sh\n", encoding="utf-8")
+        (user_home / "AGENTS.md").write_text("# global guidance", encoding="utf-8")
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+        session_home = os.path.join(provider._temp_dir, "kimi-home")
+        # bin: read-only bundled binaries → symlink.
+        assert os.path.islink(os.path.join(session_home, "bin"))
+        # AGENTS.md: small read-only guidance → copy (no write-back surface).
+        agents_md = os.path.join(session_home, "AGENTS.md")
+        assert os.path.isfile(agents_md)
+        assert not os.path.islink(agents_md)
+        assert (user_home / "AGENTS.md").read_text(encoding="utf-8") == "# global guidance"
+        provider.cleanup()
+
+    def test_credentials_dir_created_when_missing(self, monkeypatch, tmp_path):
+        """B3: source credentials/ absent (e.g. this machine: auth lives in
+        config.toml) — CAO creates it (0700) and symlinks unconditionally, so
+        any credential kimi produces during the session (MCP OAuth, token
+        flush) lands in the USER's home, never as fresh files under /tmp."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+        assert not (user_home / "credentials").exists()
+
+        provider = self._provider_with_home(user_home)
+
+        # Source store created with private perms; session link points at it.
+        assert (user_home / "credentials").is_dir()
+        assert oct(os.stat(user_home / "credentials").st_mode & 0o777) == "0o700"
+        link = os.path.join(provider._temp_dir, "kimi-home", "credentials")
+        assert os.path.islink(link)
+        assert os.path.realpath(link) == str(user_home / "credentials")
+        # A credential written through the session link lands in the user's
+        # home (kimi refresh behavior), not in /tmp.
+        (Path(link) / "mcp").mkdir()
+        (Path(link) / "mcp" / "srv-1.json").write_text('{"token": "x"}', encoding="utf-8")
+        assert (user_home / "credentials" / "mcp" / "srv-1.json").exists()
+        assert not os.path.exists(os.path.join(provider._temp_dir, "srv-1.json"))
+        provider.cleanup()
+
+    def test_config_rename_replacement_residue_cleaned_up(self, monkeypatch, tmp_path):
+        """B2: kimi persists config via atomicWrite (tmp + rename), and rename
+        REPLACES the session symlink instead of writing through — verified
+        against 0.34. When that happens the api_key exists as a plain /tmp
+        file; the guarantee is that provider.cleanup() removes the whole temp
+        dir (residue included), and the user's real config is untouched."""
+        secret = "SUPER_SECRET_TEST_VALUE"
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        (user_home / "config.toml").write_text(
+            f'[providers.fake]\napi_key = "{secret}"\n', encoding="utf-8"
+        )
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        provider = self._provider_with_home(user_home)
+        session_config = os.path.join(provider._temp_dir, "kimi-home", "config.toml")
+        assert os.path.islink(session_config)
+
+        # Simulate kimi's atomicWrite: rename a fresh regular file over the
+        # session config path (the symlink is replaced, source untouched).
+        replacement = tmp_path / "config.toml.new"
+        replacement.write_text(f'[providers.fake]\napi_key = "{secret}"\n', encoding="utf-8")
+        os.replace(replacement, session_config)
+        assert not os.path.islink(session_config)
+        assert secret in open(session_config, encoding="utf-8").read()
+        # User's real config is untouched.
+        assert (
+            (user_home / "config.toml").read_text(encoding="utf-8").startswith("[providers.fake]")
+        )
+
+        # Cleanup removes the residue with the whole temp dir.
+        temp_dir = provider._temp_dir
+        provider.cleanup()
+        assert not os.path.exists(temp_dir)
+
+    def test_mcp_json_is_the_only_allowed_regular_secret_carrier(self, monkeypatch, tmp_path):
+        """H1: profile MCP server env (expandable via resolve_env_vars from
+        .env) can embed secrets, and mcp.json is a regular file in the
+        session home. The secret scan must FIND it there (proving coverage),
+        and cleanup must remove it with the temp dir."""
+        secret = "SUPER_SECRET_TEST_VALUE"
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        with patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile") as mock_load:
+            mock_profile = MagicMock()
+            mock_profile.model = None
+            mock_profile.system_prompt = None
+            mock_profile.mcpServers = {
+                "secret-server": {
+                    "command": "npx",
+                    "args": ["-y", "srv"],
+                    "env": {"API_TOKEN": secret},
+                }
+            }
+            mock_load.return_value = mock_profile
+            provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            provider._build_kimi_command()
+
+        temp_dir = provider._temp_dir
+        hits = []
+        for root, _dirs, files in os.walk(temp_dir):
+            for fname in files:
+                path = os.path.join(root, fname)
+                if os.path.islink(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        if secret in f.read():
+                            hits.append(path)
+                except OSError:
+                    pass
+        # The ONLY regular file carrying the secret is the session mcp.json —
+        # session-local, removed with the temp dir.
+        assert hits == [os.path.join(temp_dir, "kimi-home", "mcp.json")], hits
+
+        provider.cleanup()
+        assert not os.path.exists(temp_dir)
 
 
 # =============================================================================
@@ -1004,6 +1513,37 @@ class TestKimiCliProviderMisc:
         provider.cleanup()
         assert provider._temp_dir is None
         assert not os.path.exists(temp_path)
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_cleanup_removes_session_kimi_home(self, mock_load, monkeypatch, tmp_path):
+        """agent.md + session kimi-home are removed together with the temp dir."""
+        user_home = tmp_path / "user-kimi-home"
+        user_home.mkdir()
+        monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "You are a developer"
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            provider._build_kimi_command()
+
+        temp_dir = provider._temp_dir
+        assert os.path.exists(os.path.join(temp_dir, "agent.md"))
+        assert os.path.exists(os.path.join(temp_dir, "kimi-home", "mcp.json"))
+
+        provider.cleanup()
+        assert provider._temp_dir is None
+        assert not os.path.exists(temp_dir)
 
     def test_cleanup_nonexistent_temp_dir(self):
         """Test cleanup handles already-removed temp directory gracefully."""
@@ -1174,6 +1714,153 @@ class TestKimiCodeNewTuiStatus:
         # Sanity: the completed fixture really does contain stale braille frames.
         assert any("⠀" <= ch <= "⣿" for ch in buf)
         assert self._provider().get_status(buf) != TerminalStatus.PROCESSING
+
+
+class TestKimiCodeNewTuiStaleStreamSpinner:
+    """kimi 0.34 renders its last "working…" spinner frame BELOW the response
+    bullets (screen-bottom spinner), so a finished turn can end with
+    spinner-after-bullet inside the rolling buffer while the RENDERED pane is
+    already back at the ready chrome. The stream-only checks would pin such a
+    terminal at PROCESSING forever (no further chunks → no quiescence
+    re-detection); the rendered pane is the authoritative post-dispatch
+    disambiguator (live E2E evidence, kimi 0.34 on a 220x50 CAO terminal)."""
+
+    STREAM = (
+        "✨ What is 17*23?\n"
+        "\n"
+        "• The user asks for multiplication.\n"
+        "\n"
+        "• 391.\n"
+        "\n"
+        " ⠴ working... · Tip: ctrl-s to add guidance without waiting for the turn to finish\n"
+        "\n"
+        "╭──────────────╮\n"
+        "│ >            │\n"
+        "╰──────────────╯\n"
+        "yolo  agent (Kimi-k2.6 ●)  /tmp/x\n"
+        "context: 4.0% (10.4k/262.1k)\n"
+    )
+
+    READY_PANE = (
+        "• 391.\n"
+        "╭──────────────╮\n"
+        "│ >            │\n"
+        "╰──────────────╯\n"
+        "yolo  agent (Kimi-k2.6 ●)  /tmp/x\n"
+        "context: 4.0% (10.4k/262.1k)\n"
+    )
+
+    def _dispatched_provider(self):
+        import time as _time
+
+        p = KimiCliProvider("test123", "test-session", "window-0")
+        p.mark_input_received()
+        p._last_dispatch_time = _time.time() - 30.0  # dispatch grace expired
+        return p
+
+    def test_stale_stream_spinner_with_clean_pane_is_completed(self):
+        """Stream tail shows a stale spinner after the bullets, but the rendered
+        pane is back at the ready chrome → COMPLETED (the live 0.34 shape)."""
+        p = self._dispatched_provider()
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = self.READY_PANE
+            assert p.get_status(self.STREAM) == TerminalStatus.COMPLETED
+
+    def test_live_pane_spinner_is_processing(self):
+        """Same stream, but the rendered pane still shows a live spinner →
+        genuinely PROCESSING."""
+        p = self._dispatched_provider()
+        pane = self.READY_PANE.replace("• 391.\n", "• 391.\n⠹ Thinking… 5s · 220 tokens\n")
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = pane
+            assert p.get_status(self.STREAM) == TerminalStatus.PROCESSING
+
+    def test_no_dispatch_still_trusts_stream(self):
+        """Pre-dispatch (no input sent yet, e.g. boot screens): the stream's
+        busy signal wins without a pane read — unchanged behavior."""
+        p = KimiCliProvider("test123", "test-session", "window-0")
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            assert p.get_status(self.STREAM) == TerminalStatus.PROCESSING
+            mock_backend.return_value.get_history.assert_not_called()
+
+
+class TestKimiCodeCompletionInvariant:
+    """COMPLETED is NOT "no spinner". It requires a conjunction of positive
+    signals (see report section D):
+      1. new-TUI ready chrome present (status bar "agent (…●)" OR
+         "context: N%" footer),
+      2. input latched (_has_received_input — a "•" bullet or a dispatch),
+      3. no live spinner in the stream tail / after the last bullet
+         (position-aware), confirmed against the RENDERED pane
+         post-dispatch,
+      4. no error pattern, and the dispatch grace window expired.
+    A transient frame with neither spinner nor idle chrome must stay
+    PROCESSING; long tool output mid-turn must not read COMPLETED."""
+
+    READY_CHROME = "yolo  agent (Kimi-k2.6 ●)  /tmp/x\ncontext: 4.0% (10.4k/262.1k)\n"
+
+    def _dispatched_provider(self):
+        import time as _time
+
+        p = KimiCliProvider("test123", "test-session", "window-0")
+        p.mark_input_received()
+        p._last_dispatch_time = _time.time() - 30.0  # dispatch grace expired
+        return p
+
+    def test_transient_frame_without_idle_chrome_not_completed(self):
+        """Output exists but neither spinner NOR idle chrome: the ready-chrome
+        gate fails → must NOT be COMPLETED (mid-stream / tool-output frame)."""
+        p = self._dispatched_provider()
+        transient = "• still working on it\n• chunk of tool output\n"
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            assert p.get_status(transient) != TerminalStatus.COMPLETED
+
+    def test_stale_spinner_above_latest_interaction_does_not_block(self):
+        """A stale spinner ABOVE the latest interaction (bullet) + ready
+        chrome: position-aware logic (spinner before last bullet, outside the
+        tail window) must not block COMPLETED."""
+        p = self._dispatched_provider()
+        buf = (
+            "⠹ Using handoff({...})\n"  # stale spinner above the interaction
+            "\n"
+            "• dispatched the task\n"
+            "\n"
+            "• done, all results returned\n"
+            "\n" + self.READY_CHROME
+        )
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = self.READY_CHROME
+            assert p.get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_long_tool_output_without_ready_chrome_not_completed(self):
+        """Long tool output (no spinner frames yet, no idle chrome): must not
+        read COMPLETED while the turn is still streaming output."""
+        p = self._dispatched_provider()
+        long_output = "".join(
+            f"• tool output line {i:04d} with a very long wrapped tail\n" for i in range(60)
+        )
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            assert p.get_status(long_output) != TerminalStatus.COMPLETED
+
+    def test_wrapped_long_response_with_ready_chrome_completed(self):
+        """Final long/wrapped response + idle chrome, no spinner anywhere:
+        COMPLETED (the normal happy end state)."""
+        p = self._dispatched_provider()
+        long_response = "".join(f"• wrapped bullet {i:03d} " + "x" * 200 + "\n" for i in range(40))
+        buf = long_response + "\n" + self.READY_CHROME
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = self.READY_CHROME
+            assert p.get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_active_spinner_is_processing(self):
+        """A live spinner (freshest content in stream AND rendered pane) is
+        PROCESSING even with chrome present."""
+        p = self._dispatched_provider()
+        buf = "• partial answer\n" + "⠹ Thinking… 5s · 220 tokens\n" + self.READY_CHROME
+        pane_with_spinner = "⠹ Thinking… 5s · 220 tokens\n" + self.READY_CHROME
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = pane_with_spinner
+            assert p.get_status(buf) == TerminalStatus.PROCESSING
 
 
 class TestKimiCodeNewTuiExtraction:

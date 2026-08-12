@@ -104,8 +104,8 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
         # Step 3: Assert skill catalog markers are present in the injection payload.
         # The catalog is global in Phase 1, so any installed skill should appear.
         if provider == "kimi_cli":
-            # Kimi writes the system prompt (including the skill catalog) to
-            # <temp_dir>/system.md, referenced by the agent.yaml passed via
+            # Kimi loads the system prompt (including the skill catalog) from a
+            # Markdown agent file written to <temp_dir>/agent.md, passed via
             # --agent-file. The launch command in scrollback carries only the
             # temp-dir path: parse it (capture with -J so the pane's soft
             # wrapping can't split the path mid-token) and read the payload
@@ -116,13 +116,13 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             assert resp.status_code == 200
             window_name = resp.json()["name"]
             scrollback = _capture_full_scrollback(actual_session, window_name, join_wrapped=True)
-            m = re.search(r"cd (\S*/cao_kimi_\w+)", scrollback)
+            m = re.search(r"--agent-file (\S*/cao_kimi_\w+/agent\.md)", scrollback)
             assert m, (
-                "kimi launch command with cao_kimi_* temp dir not found in "
+                "kimi launch command with --agent-file <cao_kimi_*>/agent.md not found in "
                 f"tmux scrollback. First 500 chars: {scrollback[:500]}"
             )
-            payload = Path(m.group(1), "system.md").read_text(encoding="utf-8")
-            source = f"kimi system.md ({m.group(1)})"
+            payload = Path(m.group(1)).read_text(encoding="utf-8")
+            source = f"kimi agent.md ({m.group(1)})"
         else:
             # Capture the full tmux scrollback (capture-pane -S - reads from the
             # very start of the buffer so the initial CLI command with the
@@ -176,7 +176,12 @@ class TestKimiCliSkills:
     """E2E skill injection tests for the Kimi CLI provider."""
 
     def test_skill_catalog_injected(self, require_kimi):
-        """Kimi CLI terminal command contains the injected skill catalog."""
+        """Kimi CLI terminal command contains the injected skill catalog.
+
+        Runs on the DEFAULT path (no --yolo / no allowed_tools override): the
+        trust dialog is auto-answered via the kimi_auto_trust_workspaces
+        server setting, proving a plain developer-profile worker can boot.
+        """
         _run_skill_injection_test(provider="kimi_cli", agent_profile="developer")
 
 
