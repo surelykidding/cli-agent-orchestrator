@@ -45,6 +45,25 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
+# Exact message marker of the known pyte 0.8.2 upstream bug: streams.py
+# dispatches private CSI sequences ("CSI ? …") with ``private=True`` while
+# screens.py's ``report_device_status(self, mode)`` does not accept the
+# kwarg, so Screen.feed() raises TypeError on any terminal control sequence
+# such as ``CSI ? 6 n`` (cursor-position report — emitted by nearly every
+# TUI). PyPI's latest pyte is 0.8.2; there is no fixed release to upgrade to.
+_PYTE_PRIVATE_CSI_BUG_MARKER = "unexpected keyword argument 'private'"
+
+
+def _is_pyte_private_csi_bug(exc: BaseException) -> bool:
+    """Narrow guard for the one KNOWN pyte parser failure we degrade on.
+
+    Only the exact signature-mismatch TypeError of pyte 0.8.2's private-CSI
+    dispatch triggers per-terminal degradation to the raw provider path.
+    Anything else (future pyte bugs, genuine CAO errors) still propagates and
+    stays loud instead of being silently swallowed by a broad except.
+    """
+    return isinstance(exc, TypeError) and _PYTE_PRIVATE_CSI_BUG_MARKER in str(exc)
+
 
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
@@ -77,6 +96,14 @@ class StatusMonitor:
         # keeps status flap-free.
         self._screens: Dict[str, Tuple[object, object]] = {}
         self._bursting: Dict[str, bool] = {}
+        # Per-terminal screen-detection blacklist. When pyte's parser fails on
+        # a KNOWN upstream bug (pyte 0.8.2 dispatches private CSI sequences
+        # with private=True while Screen.report_device_status() rejects the
+        # kwarg), the terminal degrades to the raw provider-detection path
+        # instead of aborting _process_chunk (which previously skipped BOTH
+        # detectors, leaving the terminal at UNKNOWN forever). Degradation is
+        # strictly per-terminal: healthy terminals keep the screen path.
+        self._screen_disabled: set[str] = set()
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
         # The event loop that owns the quiescence timers. Captured when the
@@ -140,6 +167,7 @@ class StatusMonitor:
             CAO_PYTE_STATUS
             and provider is not None
             and getattr(provider, "supports_screen_detection", False)
+            and terminal_id not in self._screen_disabled
         )
         state_buffer_max = get_server_settings()["state_buffer_max"]
 
@@ -149,7 +177,25 @@ class StatusMonitor:
                 buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
             if use_screen:
-                self._feed_screen_locked(terminal_id, chunk)
+                try:
+                    self._feed_screen_locked(terminal_id, chunk)
+                except TypeError as exc:
+                    if not _is_pyte_private_csi_bug(exc):
+                        raise
+                    # pyte 0.8.2 private-CSI bug (see _is_pyte_private_csi_bug):
+                    # degrade THIS terminal to the raw provider-detection path.
+                    # The buffer above already includes the chunk, so raw
+                    # detection runs on it below — the terminal never stalls at
+                    # UNKNOWN. Other terminals keep the screen path.
+                    self._screen_disabled.add(terminal_id)
+                    use_screen = False
+                    logger.warning(
+                        "pyte parser failure on terminal %s (%s); disabling "
+                        "screen detection for this terminal, falling back to "
+                        "raw provider detection",
+                        terminal_id,
+                        exc,
+                    )
 
         if not use_screen:
             # Debounced raw detection: same rising-edge + quiescence pattern as
@@ -315,6 +361,12 @@ class StatusMonitor:
         with self._lock:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
+
+        # A timer armed BEFORE this terminal degraded to the raw path may
+        # still fire afterwards — the raw path's own quiescence owns the
+        # terminal now, so a stale screen-derived status must not be applied.
+        if terminal_id in self._screen_disabled:
+            return
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
@@ -510,6 +562,7 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._screen_disabled.discard(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

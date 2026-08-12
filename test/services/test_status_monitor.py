@@ -9,6 +9,8 @@ provider's native status. These tests pin both paths.
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
@@ -451,3 +453,132 @@ class TestProcessChunkBufferTruncation:
         sm_large._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
         sm_large._process_chunk("t1", payload)
         assert "MARKER" in sm_large.get_buffer("t1")
+
+
+class TestPyteScreenDegradation:
+    """Patch #2: pyte 0.8.2's private-CSI TypeError must degrade the AFFECTED
+    terminal to the raw provider-detection path instead of aborting
+    _process_chunk (which previously skipped BOTH detectors and left the
+    terminal at UNKNOWN forever). Degradation is strictly per-terminal and
+    only the KNOWN TypeError signature is caught — anything else propagates.
+    """
+
+    def _screen_provider(self):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.get_status.return_value = TerminalStatus.IDLE
+        return provider
+
+    def test_known_pyte_typeerror_degrades_to_raw(self):
+        sm = StatusMonitor()
+        provider = self._screen_provider()
+        bus = MagicMock()
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(
+                sm,
+                "_feed_screen_locked",
+                side_effect=TypeError(
+                    "Screen.report_device_status() got an unexpected keyword argument 'private'"
+                ),
+            ),
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm._process_chunk("t1", "\x1b[?6n")
+
+        # Terminal degraded, raw detection ran on the buffer (status latched).
+        assert "t1" in sm._screen_disabled
+        assert sm._last_status.get("t1") == TerminalStatus.IDLE
+        provider.get_status.assert_called()
+
+    def test_degraded_terminal_skips_screen_feed(self):
+        sm = StatusMonitor()
+        provider = self._screen_provider()
+        sm._screen_disabled.add("t1")
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch.object(sm, "_feed_screen_locked", side_effect=AssertionError("must not feed")),
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm._process_chunk("t1", "x")  # must not raise
+
+        assert sm._last_status.get("t1") == TerminalStatus.IDLE
+
+    def test_degradation_is_per_terminal(self):
+        sm = StatusMonitor()
+        provider = self._screen_provider()
+        sm._screen_disabled.add("t1")  # t1 already degraded
+        fed = []
+        real_feed = sm._feed_screen_locked
+
+        def _spy_feed(tid, chunk):
+            fed.append(tid)
+            return real_feed(tid, chunk)
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch.object(sm, "_schedule_screen_detection") as mock_sched,
+            patch.object(sm, "_feed_screen_locked", side_effect=_spy_feed),
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm._process_chunk("t1", "x")  # degraded → raw, no feed
+            sm._process_chunk("t2", "x")  # healthy → screen path, feed happens
+
+        assert fed == ["t2"]
+        assert "t2" not in sm._screen_disabled
+        mock_sched.assert_called_once()
+
+    def test_unknown_feed_exception_still_propagates(self):
+        sm = StatusMonitor()
+        provider = self._screen_provider()
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch.object(sm, "_feed_screen_locked", side_effect=RuntimeError("boom")),
+        ):
+            mock_pm.get_provider.return_value = provider
+            with pytest.raises(RuntimeError, match="boom"):
+                sm._process_chunk("t1", "x")
+
+        assert "t1" not in sm._screen_disabled
+        assert "t1" not in sm._last_status
+
+    def test_unrelated_typeerror_still_propagates(self):
+        """A TypeError WITHOUT the pyte marker is not the known bug — it must
+        stay loud, never silently degrade."""
+        sm = StatusMonitor()
+        provider = self._screen_provider()
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch.object(
+                sm, "_feed_screen_locked", side_effect=TypeError("some other signature problem")
+            ),
+        ):
+            mock_pm.get_provider.return_value = provider
+            with pytest.raises(TypeError, match="some other"):
+                sm._process_chunk("t1", "x")
+
+        assert "t1" not in sm._screen_disabled
+
+    def test_stale_screen_quiescent_skipped_after_degradation(self):
+        """A quiescence timer armed BEFORE degradation must not apply a stale
+        screen-derived status afterwards — the raw path owns the terminal."""
+        sm = StatusMonitor()
+        sm._screen_disabled.add("t1")
+        provider = MagicMock()
+        with patch.object(
+            sm, "_detect_screen", side_effect=AssertionError("must not detect on screen")
+        ):
+            sm._on_screen_quiescent("t1", provider)  # must not raise
+        assert sm._bursting.get("t1") is False
+
+    def test_clear_terminal_forgets_degradation(self):
+        sm = StatusMonitor()
+        sm._screen_disabled.add("t1")
+        sm.clear_terminal("t1")
+        assert "t1" not in sm._screen_disabled
