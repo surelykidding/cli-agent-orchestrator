@@ -73,6 +73,7 @@ def test_prompt_submission_and_lifecycle_properties():
     assert provider.exit_cli() == "/quit"
     assert provider.supports_screen_detection is False
     assert provider.supports_direct_status_probe is False
+    assert provider.supports_stale_processing_capture is True
 
 
 @pytest.mark.parametrize(
@@ -573,6 +574,177 @@ def test_buffer_clear_generation_rejects_stale_identical_completion_without_acti
         monitor._process_chunk("test-terminal", completed)
 
     assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_stale_processing_direct_probe_recovers_rendered_completion(mock_pm, mock_get_backend):
+    """A quiet stale raw PROCESSING buffer self-heals from the live Grok pane.
+
+    Regression guard for #813: the pipe-pane stream can retain the turn's busy
+    markers after Grok has already rendered ``Worked for ...`` and returned to
+    the empty composer.  Grok now opts into StatusMonitor's rendered
+    capture-pane fallback, which still requires two matching ready reads before
+    changing the latched status.
+    """
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = load_fixture("grok_cli_completed.txt")
+    mock_get_backend.return_value = backend
+
+    provider = make_provider()
+    provider.mark_input_received()
+    processing = load_fixture("grok_cli_processing.txt")
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    raw_fifo_baseline = provider._last_status_buffer
+    raw_fifo_stream_start = provider._last_status_buffer_stream_start
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    # PROCESSING was genuinely observed in the current input generation; that
+    # is what authorizes stale-pane recovery once the raw buffer goes quiet.
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffers["test-terminal"] = processing
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    # First rendered ready sample is only a candidate.
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    assert provider._awaiting_turn_activity is True
+    assert provider._last_status_buffer == raw_fifo_baseline
+    assert provider._last_status_buffer_stream_start == raw_fifo_stream_start
+
+    # The second matching sample confirms the live viewport and heals the
+    # stale raw-stream classification.
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+    assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+    assert provider._last_completion_identity is not None
+    assert provider._last_completion_stream_offset is None
+    assert provider._awaiting_turn_activity is False
+    assert provider._last_status_buffer == raw_fifo_baseline
+    assert provider._last_status_buffer_stream_start == raw_fifo_stream_start
+    backend.get_history.assert_called_with(
+        "test-session", "test-window", strip_escapes=True, visible_only=True
+    )
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_direct_probe_does_not_complete_new_turn_from_previous_rendered_completion(
+    mock_pm, mock_get_backend
+):
+    """A previous turn's settled viewport is not completion evidence for a new turn."""
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    mock_get_backend.return_value = backend
+
+    provider = make_provider()
+    completed = load_fixture("grok_cli_completed.txt")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+
+    # Arm a second turn, but let capture-pane still show the previous completed
+    # frame.  Grok's completion identity guard must keep the direct probe busy.
+    provider.mark_input_received()
+    mock_pm.get_provider.return_value = provider
+
+    backend.get_history.return_value = completed
+
+    monitor = StatusMonitor()
+    monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
+    monitor._buffers["test-terminal"] = ""
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+
+
+def test_stale_processing_capture_opt_in_does_not_certify_deferred_task_pickup():
+    """A retained old completion must not disable dropped-paste recovery.
+
+    Grok returns PROCESSING for that frame after a new dispatch on purpose: it
+    means "do not finish the new turn from stale completion", not "the new task
+    definitely started". The stale-PROCESSING recovery opt-in must therefore
+    remain separate from terminal_service's deferred-init direct probe.
+    """
+
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    provider = make_provider()
+    completed = load_fixture("grok_cli_completed.txt")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.PROCESSING
+
+    with (
+        patch.object(ts, "_worker_is_started_direct") as direct_probe,
+        patch.object(ts, "_message_visible_in_box", return_value=False),
+        patch.object(ts, "send_input") as resend,
+    ):
+        assert ts.redeliver_dropped_message("test-terminal", "new task", 1, provider) is False
+
+    direct_probe.assert_not_called()
+    resend.assert_called_once()
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_unparsed_previous_completion_cannot_complete_new_dropped_turn(mock_pm, mock_get_backend):
+    """A PROCESSING latch from turn 1 cannot heal turn 2 from turn-1's pane.
+
+    This is the #813 wedge that a completion-identity-only guard cannot cover:
+    turn 1's raw FIFO never parses its completion, so Grok has no previous
+    completion identity.  If turn 2 is dispatched and its paste is dropped,
+    the rendered pane still shows turn 1's completion.  The old PROCESSING
+    observation belongs to the previous input generation and therefore cannot
+    authorize stale-pane recovery for turn 2.
+    """
+
+    provider = make_provider()
+    processing = load_fixture("grok_cli_processing.txt")
+    completed = load_fixture("grok_cli_completed.txt")
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = completed
+    mock_get_backend.return_value = backend
+
+    provider.mark_input_received()
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffers["test-terminal"] = processing
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+    assert monitor._processing_generation["test-terminal"] == 0
+
+    # Turn 2 begins, but no real provider output follows: cached PROCESSING is
+    # retained while the capture generation advances to 1.
+    monitor.notify_input_sent("test-terminal")
+    monitor.clear_rolling_buffer("test-terminal", provider)
+    provider.mark_input_received()
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    # Recovery is ineligible before current-generation PROCESSING evidence, so
+    # the stale rendered pane is never sampled at all.
+    backend.get_history.assert_not_called()
 
 
 @pytest.mark.parametrize("raw", [False, True])

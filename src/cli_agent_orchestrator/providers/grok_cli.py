@@ -174,6 +174,17 @@ def _toml_string(value: Any) -> str:
 class GrokCliProvider(BaseProvider):
     """Provider for the official ``grok`` interactive TUI."""
 
+    # Grok's status detector normalizes terminal escapes and uses structural,
+    # line-oriented chrome (processing markers, completion rows, composer and
+    # footer), so it is safe to run against a settled rendered tmux viewport.
+    # Opt in only to StatusMonitor's quiet stale-PROCESSING recovery. Do NOT opt
+    # into ``supports_direct_status_probe``: after a new dispatch Grok
+    # deliberately reports a retained previous completion as PROCESSING, which
+    # is the safe status verdict but is not proof that the new paste was
+    # accepted. Using it as deferred-init pickup evidence would suppress the
+    # redelivery that a genuinely dropped paste needs.
+    supports_stale_processing_capture = True
+
     def __init__(
         self,
         terminal_id: str,
@@ -673,6 +684,75 @@ class GrokCliProvider(BaseProvider):
         self._status_buffer_epoch = epoch
         self._last_status_buffer = None
         self._last_status_buffer_stream_start = 0
+
+    def _status_probe_state(self) -> tuple:
+        """Mutable status-detector state touched by :meth:`get_status`.
+
+        Stale capture-pane recovery samples a rendered snapshot before the
+        monitor has decided whether to trust it.  Those speculative reads must
+        not advance completion identity or replace the rolling-FIFO coordinate
+        baseline, so the monitor uses the transactional helpers below.
+        """
+
+        return (
+            self._awaiting_turn_activity,
+            self._turn_activity_seen,
+            self._last_completion_identity,
+            self._last_completion_stream_offset,
+            self._last_completion_buffer_epoch,
+            self._last_status_buffer,
+            self._last_status_buffer_stream_start,
+        )
+
+    def _restore_status_probe_state(self, state: tuple) -> None:
+        (
+            self._awaiting_turn_activity,
+            self._turn_activity_seen,
+            self._last_completion_identity,
+            self._last_completion_stream_offset,
+            self._last_completion_buffer_epoch,
+            self._last_status_buffer,
+            self._last_status_buffer_stream_start,
+        ) = state
+
+    def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
+        """Classify a rendered stale-PROCESSING snapshot without side effects."""
+
+        state = self._status_probe_state()
+        try:
+            return self.get_status(output)
+        finally:
+            self._restore_status_probe_state(state)
+
+    def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
+        """Commit one previously-confirmed rendered snapshot transactionally.
+
+        If provider state changed concurrently and the same bytes no longer
+        classify as the confirmed verdict, restore the pre-commit state and
+        fail closed; StatusMonitor will leave the terminal PROCESSING.
+        """
+
+        state = self._status_probe_state()
+        detected = self.get_status(output)
+        if detected != expected:
+            self._restore_status_probe_state(state)
+            return False
+        committed = self._status_probe_state()
+
+        # ``output`` is a rendered viewport, not StatusMonitor's rolling FIFO.
+        # Keep the semantic detector changes earned by the confirmed pane, but
+        # restore the FIFO overlap baseline/cursor coordinate space completely.
+        # If this pane establishes a new completion identity, its FIFO position
+        # is deliberately unknown rather than a viewport-relative byte offset
+        # masquerading as a stream cursor.
+        self._restore_status_probe_state(state)
+        self._awaiting_turn_activity = committed[0]
+        self._turn_activity_seen = committed[1]
+        if committed[2] != state[2]:
+            self._last_completion_identity = committed[2]
+            self._last_completion_stream_offset = None
+            self._last_completion_buffer_epoch = committed[4]
+        return True
 
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
