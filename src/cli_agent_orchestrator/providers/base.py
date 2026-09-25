@@ -203,6 +203,15 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
+    # Opt-in only for StatusMonitor's quiet stale-PROCESSING capture-pane
+    # recovery. This is intentionally distinct from
+    # ``supports_direct_status_probe``: the latter also certifies deferred-init
+    # task pickup, where a provider's conservative PROCESSING fallback may mean
+    # "this rendered frame is stale/ambiguous" rather than "the new task
+    # started". A provider can therefore be safe to re-check from a settled
+    # rendered viewport without being safe as delivery evidence.
+    supports_stale_processing_capture: bool = False
+
     # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
     # Set True ONLY alongside a probe_processing_from_screen() override that is
     # side-effect free. The probe runs on a HALF-DRAWN frame, off the two edges

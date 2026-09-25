@@ -26,6 +26,7 @@ import shutil
 import signal
 import stat
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -174,6 +175,17 @@ def _toml_string(value: Any) -> str:
 class GrokCliProvider(BaseProvider):
     """Provider for the official ``grok`` interactive TUI."""
 
+    # Grok's status detector normalizes terminal escapes and uses structural,
+    # line-oriented chrome (processing markers, completion rows, composer and
+    # footer), so it is safe to run against a settled rendered tmux viewport.
+    # Opt in only to StatusMonitor's quiet stale-PROCESSING recovery. Do NOT opt
+    # into ``supports_direct_status_probe``: after a new dispatch Grok
+    # deliberately reports a retained previous completion as PROCESSING, which
+    # is the safe status verdict but is not proof that the new paste was
+    # accepted. Using it as deferred-init pickup evidence would suppress the
+    # redelivery that a genuinely dropped paste needs.
+    supports_stale_processing_capture = True
+
     def __init__(
         self,
         terminal_id: str,
@@ -209,6 +221,20 @@ class GrokCliProvider(BaseProvider):
         self._status_buffer_epoch = 0
         self._last_status_buffer: Optional[str] = None
         self._last_status_buffer_stream_start = 0
+        # ``get_status`` mutates turn-attribution state. Stale-pane recovery
+        # deliberately snapshots those fields, runs a speculative detection,
+        # then restores them until StatusMonitor confirms the pane. Serialize
+        # that transaction with normal detection and turn-boundary updates: an
+        # otherwise-correct speculative restore must never erase a concurrent
+        # ``mark_input_received`` or normal status observation.
+        self._status_state_lock = threading.RLock()
+        # Side-effect-free stale-pane probes run outside StatusMonitor's lock.
+        # Keep the latest probe's before/after detector snapshots so the later
+        # commit can be pure in-memory: no provider.get_status() (and therefore
+        # no native-backend probe) while the monitor lock is held.
+        self._stale_capture_probe_candidate: Optional[tuple[str, TerminalStatus, tuple, tuple]] = (
+            None
+        )
 
     @property
     def paste_enter_count(self) -> int:
@@ -668,13 +694,117 @@ class GrokCliProvider(BaseProvider):
         first chunk for the newly dispatched turn.
         """
 
-        if epoch <= self._status_buffer_epoch:
-            return
-        self._status_buffer_epoch = epoch
-        self._last_status_buffer = None
-        self._last_status_buffer_stream_start = 0
+        with self._status_state_lock:
+            if epoch <= self._status_buffer_epoch:
+                return
+            self._status_buffer_epoch = epoch
+            self._last_status_buffer = None
+            self._last_status_buffer_stream_start = 0
+            self._stale_capture_probe_candidate = None
+
+    def _status_probe_state(self) -> tuple:
+        """Mutable status-detector state touched by :meth:`get_status`.
+
+        Stale capture-pane recovery samples a rendered snapshot before the
+        monitor has decided whether to trust it.  Those speculative reads must
+        not advance completion identity or replace the rolling-FIFO coordinate
+        baseline, so the monitor uses the transactional helpers below.
+        """
+
+        return (
+            self._awaiting_turn_activity,
+            self._turn_activity_seen,
+            self._last_completion_identity,
+            self._last_completion_stream_offset,
+            self._last_completion_buffer_epoch,
+            self._last_status_buffer,
+            self._last_status_buffer_stream_start,
+        )
+
+    def _restore_status_probe_state(self, state: tuple) -> None:
+        (
+            self._awaiting_turn_activity,
+            self._turn_activity_seen,
+            self._last_completion_identity,
+            self._last_completion_stream_offset,
+            self._last_completion_buffer_epoch,
+            self._last_status_buffer,
+            self._last_status_buffer_stream_start,
+        ) = state
+
+    def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
+        """Classify a rendered stale-PROCESSING snapshot without side effects."""
+
+        with self._status_state_lock:
+            # The very first turn has no predecessor identity by definition, so it
+            # must be allowed to recover the #813 raw-FIFO wedge from its rendered
+            # completion.  On later turns, however, a missing predecessor identity
+            # means CAO never established which completion belonged to the previous
+            # turn.  In that state a rendered ready pane is fundamentally
+            # unattributable: a dropped new paste can leave turn N-1's completion on
+            # screen, and even a fresh raw repaint may transiently re-establish a
+            # PROCESSING status for generation N.  Never let that generic activity
+            # turn an identity-less old pane into N's completion.  Fail closed until
+            # some normal/recovered completion has established the predecessor
+            # identity.
+            if self._turns > 1 and self._last_completion_identity is None:
+                self._stale_capture_probe_candidate = None
+                return TerminalStatus.PROCESSING
+
+            state = self._status_probe_state()
+            try:
+                detected = self._get_status_unlocked(output)
+                committed = self._status_probe_state()
+            finally:
+                self._restore_status_probe_state(state)
+            self._stale_capture_probe_candidate = (
+                hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                detected,
+                state,
+                committed,
+            )
+            return detected
+
+    def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
+        """Commit one previously-confirmed rendered snapshot transactionally.
+
+        If provider state changed concurrently and the same bytes no longer
+        classify as the confirmed verdict, restore the pre-commit state and
+        fail closed; StatusMonitor will leave the terminal PROCESSING.
+        """
+
+        with self._status_state_lock:
+            candidate = self._stale_capture_probe_candidate
+            self._stale_capture_probe_candidate = None
+            if candidate is None:
+                return False
+            fingerprint, detected, state, committed = candidate
+            if (
+                fingerprint != hashlib.sha256(output.encode("utf-8")).hexdigest()
+                or detected != expected
+                or self._status_probe_state() != state
+            ):
+                return False
+
+            # ``output`` is a rendered viewport, not StatusMonitor's rolling FIFO.
+            # Keep the semantic detector changes earned by the confirmed pane, but
+            # restore the FIFO overlap baseline/cursor coordinate space completely.
+            # If this pane establishes a new completion identity, its FIFO position
+            # is deliberately unknown rather than a viewport-relative byte offset
+            # masquerading as a stream cursor.
+            self._awaiting_turn_activity = committed[0]
+            self._turn_activity_seen = committed[1]
+            if committed[2] != state[2]:
+                self._last_completion_identity = committed[2]
+                self._last_completion_stream_offset = None
+                self._last_completion_buffer_epoch = committed[4]
+            return True
 
     def get_status(self, output: Optional[str]) -> TerminalStatus:
+        with self._status_state_lock:
+            return self._get_status_unlocked(output)
+
+    def _get_status_unlocked(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
         if native is not None:
             return native
@@ -820,6 +950,21 @@ class GrokCliProvider(BaseProvider):
 
         if last_ready >= 0:
             if last_completion >= 0 and self._turns > 0:
+                # A completion on turn 2+ is attributable only when CAO has a
+                # predecessor completion identity to compare it against. A
+                # dropped paste can be followed by a raw repaint of turn N-1's
+                # completed screen; that repaint may first look PROCESSING and
+                # then become a structurally complete ready frame as its old
+                # ``Worked for`` row arrives. Generic redraw activity cannot
+                # establish ownership when N-1 was never identified. Turn 1 is
+                # exempt because it has no predecessor and is the #813 recovery
+                # case itself.
+                if (
+                    self._awaiting_turn_activity
+                    and self._turns > 1
+                    and self._last_completion_identity is None
+                ):
+                    return TerminalStatus.PROCESSING
                 completion_match = completion_matches[-1]
                 completion_start = len(clean) - len(tail) + completion_match.start()
                 completion_end = len(clean) - len(tail) + completion_match.end()
@@ -1206,7 +1351,9 @@ class GrokCliProvider(BaseProvider):
             return True
 
     def mark_input_received(self) -> None:
-        super().mark_input_received()
-        self._turns += 1
-        self._awaiting_turn_activity = True
-        self._turn_activity_seen = False
+        with self._status_state_lock:
+            super().mark_input_received()
+            self._turns += 1
+            self._awaiting_turn_activity = True
+            self._turn_activity_seen = False
+            self._stale_capture_probe_candidate = None
