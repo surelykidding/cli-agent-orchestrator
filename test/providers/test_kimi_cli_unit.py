@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     KimiDialect,
     KimiProbeResult,
     ProviderError,
+    _has_terminal_error,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -1197,6 +1198,18 @@ class TestKimiCliProviderPatterns:
         """Test error pattern detection."""
         assert re.search(ERROR_PATTERN, "Error: connection failed", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "ERROR: something went wrong", re.MULTILINE)
+        assert not re.search(
+            ERROR_PATTERN,
+            "   Error: Failed to start a session: Model bad-model is not configured.",
+            re.MULTILINE,
+        )
+        assert _has_terminal_error(
+            "   Error: Failed to start a session: Model bad-model is not configured."
+        )
+        assert not _has_terminal_error(
+            "● The command failed with this message:\n"
+            "   Error: Failed to start a session: Model bad-model is not configured."
+        )
         assert re.search(ERROR_PATTERN, "ConnectionError: timeout", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "APIError: rate limited", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "Traceback (most recent call last):", re.MULTILINE)

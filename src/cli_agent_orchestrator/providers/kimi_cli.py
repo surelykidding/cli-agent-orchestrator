@@ -700,9 +700,27 @@ def _is_live_turn_spinner_line(
 BULLET_LINE_PATTERN = kt.BULLET_ANY_RE
 
 # Generic error patterns for detecting failure states in terminal output.
+# Legacy/plain failures begin at column zero.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
 )
+
+# Kimi Code 2.1.1 renders a launch/session failure indented inside the TUI
+# content column. Keep this OUT of the generic pattern: a perfectly valid
+# assistant answer can quote the same text as an indented continuation row.
+# ``_has_terminal_error`` only treats this measured shape as fatal when the
+# current frame/buffer contains no response marker at all. That is the correct
+# contract for this startup failure: an invalid model cannot have produced an
+# assistant response for the same turn.
+INDENTED_SESSION_START_ERROR_PATTERN = r"^[^\S\n]+Error:\s+Failed to start a session:"
+
+
+def _has_terminal_error(text: str) -> bool:
+    if re.search(ERROR_PATTERN, text, re.MULTILINE):
+        return True
+    if kt.has_response_marker(text):
+        return False
+    return bool(re.search(INDENTED_SESSION_START_ERROR_PATTERN, text, re.MULTILINE))
 
 
 class KimiCliProvider(BaseProvider):
@@ -2147,7 +2165,7 @@ class KimiCliProvider(BaseProvider):
                     # fall through to the stream-derived ready status.
                     pass
 
-            if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+            if _has_terminal_error(clean_output):
                 return TerminalStatus.ERROR
 
             return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
@@ -2205,7 +2223,7 @@ class KimiCliProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         # No idle prompt at bottom — check for errors before assuming processing
-        if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+        if _has_terminal_error(clean_output):
             return TerminalStatus.ERROR
 
         # No prompt visible and no error: Kimi is actively processing/streaming
@@ -2314,7 +2332,7 @@ class KimiCliProvider(BaseProvider):
             semantics = self._spinner_semantics()
             if any(_is_live_turn_spinner_line(ln, semantics) for ln in tail):
                 return TerminalStatus.PROCESSING
-            if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+            if _has_terminal_error(joined):
                 return TerminalStatus.ERROR
             return (
                 TerminalStatus.COMPLETED if kt.has_response_marker(joined) else TerminalStatus.IDLE
@@ -2326,7 +2344,7 @@ class KimiCliProvider(BaseProvider):
                 TerminalStatus.COMPLETED if kt.has_response_marker(joined) else TerminalStatus.IDLE
             )
 
-        if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+        if _has_terminal_error(joined):
             return TerminalStatus.ERROR
         # No Kimi TUI chrome on the composited screen at all (boot screen, or a
         # torn-down pane back at the shell). On the RAW path "no prompt = still

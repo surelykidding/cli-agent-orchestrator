@@ -2081,6 +2081,46 @@ class TestKimiCodeStatusOnRealCaptures:
         provider = KimiCliProvider("t-empty", "s", "w")
         assert provider.get_status("") is TerminalStatus.UNKNOWN
 
+    def test_invalid_model_turn_is_error(self):
+        """Kimi Code validates a model alias only when the first turn starts.
+
+        The TUI remains fully rendered and returns to an empty composer after
+        the failure, so ready chrome must not hide the error line. This is the
+        live Kimi Code 2.1.1 shape that previously fell into deferred-submit
+        redelivery when pyte dropped the frame.
+        """
+
+        provider = KimiCliProvider("t-bad-model", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        screen = [
+            '   Error: Failed to start a session: Model "bad-model" is',
+            " not configured in config.toml.",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  bad-model thinking  /tmp/project",
+            "context: 0%",
+        ]
+
+        assert provider.get_status_from_screen(screen) is TerminalStatus.ERROR
+
+    def test_answer_quoting_invalid_model_error_is_completed(self):
+        """Quoted startup-error prose belongs to the answer, not terminal state."""
+
+        provider = KimiCliProvider("t-quoted-model-error", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        screen = [
+            "● The command failed with this message:",
+            '   Error: Failed to start a session: Model "bad-model" is not configured.',
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+
+        assert provider.get_status_from_screen(screen) is TerminalStatus.COMPLETED
+
     def test_legacy_fixture_still_completes(self):
         """A2.1 — the legacy path must be untouched."""
 
