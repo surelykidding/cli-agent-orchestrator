@@ -31,6 +31,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock
@@ -65,6 +66,7 @@ from cli_agent_orchestrator.providers.kimi_runtime_home import (
     PRESERVE_FILES,
     TRUST_DIR_NAME,
     KimiCodeRuntimeHomeBuilder,
+    RuntimeHomeError,
     iter_forbidden_runtime_state,
     kimi_agent_name,
     merge_mcp_servers,
@@ -970,6 +972,7 @@ class TestKimiCodeMarkdownAgent:
         profile.system_prompt = prompt
         profile.model = None
         profile.mcpServers = None
+        profile.tools = None
         return provider, profile
 
     def test_base_prompt_interpolated_before_cao_text(self):
@@ -999,10 +1002,87 @@ class TestKimiCodeMarkdownAgent:
         rendered = provider._render_markdown_agent(profile)
         assert "SKILL BLOCK" in rendered
 
+    def test_native_tools_are_emitted_in_agent_frontmatter(self):
+        provider, profile = self._provider_with_prompt("review only")
+        profile.tools = [
+            "Read",
+            "Grep",
+            "Glob",
+            "mcp__cao-bridge-worker-mcp__complete_turn",
+        ]
+
+        rendered = provider._render_markdown_agent(profile)
+
+        assert (
+            'tools: ["Read", "Grep", "Glob", ' '"mcp__cao-bridge-worker-mcp__complete_turn"]'
+        ) in rendered
+        assert rendered.index("tools:") < rendered.index("---\n\n${base_prompt}")
+
+    def test_empty_native_tools_still_create_deny_all_agent_file(self):
+        provider, profile = self._provider_with_prompt("   ")
+        profile.tools = []
+
+        rendered = provider._render_markdown_agent(profile)
+
+        assert "tools: []" in rendered
+        assert "${base_prompt}" in rendered
+
     def test_agent_name_slugifies_and_defaults(self):
         assert kimi_agent_name("Term 1/Abc") == "cao-kimi-term-1-abc"
         assert kimi_agent_name("") == "cao-kimi-terminal"
         assert len(kimi_agent_name("x" * 200)) <= len("cao-kimi-") + 48
+
+
+class TestKimiCodeRuntimeToolPolicy:
+    def test_profile_tools_are_written_to_runtime_global_allowlist(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('[providers.demo]\ntype = "openai"\n')
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read", "Grep", "mcp__bridge__complete_turn"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == [
+            "Read",
+            "Grep",
+            "mcp__bridge__complete_turn",
+        ]
+
+    def test_profile_tools_intersect_existing_runtime_allowlist(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text(
+            '[tools]\nenabled = ["Read", "Bash", "mcp__bridge__*"]\n'
+            'disabled = ["mcp__bridge__dangerous"]\n'
+        )
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read", "Glob", "mcp__bridge__complete_turn"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == ["Read", "mcp__bridge__complete_turn"]
+        assert parsed["tools"]["disabled"] == ["mcp__bridge__dangerous"]
+
+    def test_disjoint_existing_and_profile_tools_fail_closed(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('[tools]\nenabled = ["Bash"]\n')
+
+        with pytest.raises(RuntimeHomeError, match="no overlap"):
+            KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(tool_allowlist=["Read"])
+
+    def test_no_profile_tools_leave_runtime_config_unchanged(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        original = '[tools]\nenabled = ["Bash"]\n'
+        (source / "config.toml").write_text(original)
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build()
+
+        assert (result.home / "config.toml").read_text() == original
 
 
 # =============================================================================

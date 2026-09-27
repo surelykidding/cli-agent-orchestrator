@@ -57,7 +57,9 @@ import os
 import re
 import shutil
 import stat
+import tomllib
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -444,7 +446,11 @@ class KimiCodeRuntimeHomeBuilder:
 
     # -- build ------------------------------------------------------------
 
-    def build(self, profile_mcp_servers: Optional[Mapping[str, Any]] = None) -> RuntimeHomeResult:
+    def build(
+        self,
+        profile_mcp_servers: Optional[Mapping[str, Any]] = None,
+        tool_allowlist: Optional[Sequence[str]] = None,
+    ) -> RuntimeHomeResult:
         """Materialise the runtime home. Idempotent for a given builder."""
 
         if self._result is not None:
@@ -485,6 +491,9 @@ class KimiCodeRuntimeHomeBuilder:
         trust_records, trust_skipped, trust_state, trust_truncated = (
             self._snapshot_workspace_trust()
         )
+
+        if tool_allowlist is not None:
+            self._apply_tool_allowlist(self._home / "config.toml", tool_allowlist)
 
         for name in LINK_DIRS:
             src = self._source / name
@@ -528,6 +537,155 @@ class KimiCodeRuntimeHomeBuilder:
             trust_truncated,
         )
         return result
+
+    @staticmethod
+    def _tool_pattern_intersection(left: str, right: str) -> Optional[str]:
+        """Return a conservative pattern representing ``left ∩ right``.
+
+        Kimi's built-ins are exact names. MCP entries are fnmatch-style globs;
+        the overwhelmingly common shape is a trailing ``*`` for one server.
+        Keep only intersections we can prove without broadening either side.
+        """
+
+        if left == "*":
+            return right
+        if right == "*":
+            return left
+        if left == right:
+            return left
+
+        left_mcp = left.startswith("mcp__")
+        right_mcp = right.startswith("mcp__")
+        if not left_mcp or not right_mcp:
+            return None
+
+        left_glob = any(ch in left for ch in "*?[")
+        right_glob = any(ch in right for ch in "*?[")
+        if not left_glob and fnmatchcase(left, right):
+            return left
+        if not right_glob and fnmatchcase(right, left):
+            return right
+
+        # For the supported server-glob shape, the longer prefix is the strict
+        # subset when one prefix contains the other. More exotic overlapping
+        # globs fail closed instead of guessing a wider pattern.
+        if left.endswith("*") and right.endswith("*"):
+            left_prefix = left[:-1]
+            right_prefix = right[:-1]
+            if left_prefix.startswith(right_prefix):
+                return left
+            if right_prefix.startswith(left_prefix):
+                return right
+        return None
+
+    @classmethod
+    def _intersect_tool_allowlists(
+        cls, existing: Sequence[str], requested: Sequence[str]
+    ) -> List[str]:
+        result: List[str] = []
+        for left in existing:
+            for right in requested:
+                overlap = cls._tool_pattern_intersection(str(left), str(right))
+                if overlap is not None and overlap not in result:
+                    result.append(overlap)
+        return result
+
+    @classmethod
+    def _apply_tool_allowlist(cls, path: Path, requested: Sequence[str]) -> None:
+        """Enforce a profile tool allowlist in the per-worker Kimi config.
+
+        Kimi Code 2.1.1 currently ignores main-agent ``tools`` frontmatter in
+        interactive launches, while its global ``[tools].enabled`` switch is
+        enforced even under ``--auto``. The runtime home is already private to
+        this worker, so applying the profile policy here creates the hard tool
+        boundary without mutating the operator's real config.
+
+        An existing non-empty global allowlist is intersected with the profile
+        policy. Empty global ``enabled`` means "unrestricted" in Kimi config,
+        so it is replaced by the profile list. A disjoint intersection fails
+        closed instead of launching with a broader surface.
+        """
+
+        requested_list = [str(item) for item in requested]
+        if requested_list == ["*"]:
+            return
+        if not requested_list:
+            raise RuntimeHomeError(
+                "Kimi Code runtime hard tool policy cannot represent an empty allowlist"
+            )
+
+        try:
+            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            parsed = tomllib.loads(text) if text.strip() else {}
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise RuntimeHomeError(f"Could not read runtime Kimi config {path}: {exc}") from exc
+
+        tools = parsed.get("tools", {})
+        if tools is None:
+            tools = {}
+        if not isinstance(tools, dict):
+            raise RuntimeHomeError("Kimi Code [tools] config must be a table")
+        existing = tools.get("enabled")
+        if existing is not None and (
+            not isinstance(existing, list) or not all(isinstance(item, str) for item in existing)
+        ):
+            raise RuntimeHomeError("Kimi Code tools.enabled must be an array of strings")
+
+        if existing:
+            effective = cls._intersect_tool_allowlists(existing, requested_list)
+            if not effective:
+                raise RuntimeHomeError(
+                    "Kimi Code profile tool allowlist has no overlap with existing tools.enabled"
+                )
+        else:
+            effective = requested_list
+
+        rendered = json.dumps(effective, ensure_ascii=False)
+        section_re = re.compile(r"(?m)^\s*\[tools\]\s*(?:#.*)?$")
+        match = section_re.search(text)
+        if match is None:
+            separator = "" if not text or text.endswith("\n") else "\n"
+            new_text = f"{text}{separator}\n[tools]\nenabled = {rendered}\n"
+        else:
+            next_section = re.search(r"(?m)^\s*\[\[?[^\n]+", text[match.end() :])
+            section_end = (
+                match.end() + next_section.start() if next_section is not None else len(text)
+            )
+            section = text[match.start() : section_end]
+            enabled_re = re.compile(r"(?m)^\s*enabled\s*=.*$")
+            if enabled_re.search(section):
+                section = enabled_re.sub(f"enabled = {rendered}", section, count=1)
+            else:
+                header_end = section.find("\n")
+                if header_end < 0:
+                    section = f"{section}\nenabled = {rendered}\n"
+                else:
+                    section = (
+                        section[: header_end + 1]
+                        + f"enabled = {rendered}\n"
+                        + section[header_end + 1 :]
+                    )
+            new_text = text[: match.start()] + section + text[section_end:]
+
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(path.name + ".tools.tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, new_text.encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise RuntimeHomeError(f"Could not write runtime Kimi config {path}: {exc}") from exc
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:  # pragma: no cover
+                    pass
 
     # -- cleanup ----------------------------------------------------------
 
